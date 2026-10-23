@@ -1,0 +1,8 @@
+/target/
+/.tools/
+/.cargo/config.toml
+/.vs/
+*.sqlite*
+.env
+/config.toml
+/artifacts/

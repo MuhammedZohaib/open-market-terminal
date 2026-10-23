@@ -1,0 +1,13 @@
+[package]
+name = "omt-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+omt-core.workspace = true
+omt-data.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+

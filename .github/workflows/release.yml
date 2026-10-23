@@ -1,0 +1,36 @@
+name: Release packages
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+            binary: omt
+          - os: macos-latest
+            label: macos-arm64
+            binary: omt
+          - os: windows-latest
+            label: windows-x86_64
+            binary: omt.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --workspace
+      - run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omt-${{ matrix.label }}
+          path: |
+            target/release/${{ matrix.binary }}
+            README.md
+            LICENSE
+            THIRD_PARTY_NOTICES.md
+            examples/config.toml

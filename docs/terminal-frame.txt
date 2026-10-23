@@ -1,0 +1,40 @@
+﻿ OMT  MARKET <MKT> │ IEX:AAPL │ Binance Spot: Live (1383 pairs) │ 2026-10-23 19:07:40 UTC                                                   
+ 1:MARKET[MKT]  2:CHART[GP]  3:FIN[FA]  4:NEWS[CN]  5:SCAN[EQS]  6:PORT[PRTU]  7:ECON[ECST]  │  GO > Press : or / to enter command or symbol
+┌ Watch: default (3) ──┐ MARKET OVERVIEW   Binance Spot │ 3696 discovered pairs (1383 trading) │ 516 match f┌ Instrument & Source Context ─┐
+│SYMBOL  LAST    24H%  │ Quote[u]: [USDT] MinVol[l]: 0 Status[x]: TRADING Sort[s/o]: QVOL DESC Filter: none │BINANCE:USDCUSDT              │
+│BTCUSDT 81,406. +0.01%│                                                                                    │USDC/USDT | TRADING | Tick    │
+│ETHUSDT 2,399.5 +0.68%│┌ MARKET OVERVIEW — USDT / 516 rows (Enter: Open Chart, w: Toggle Watchlist) ──────┐│1e-5                          │
+│SOLUSDT 104.10  +0.62%││SYMBOL           PAIR          LAST           24H %       QUOTE VOL    STATUS     ││Last: 1.001 USDT              │
+│                      ││USDCUSDT         USDC/USDT     1.001          -0.01%      1.47B        Live       ││24h Chg: -0.000150 (-0.01%)   │
+│                      ││BTCUSDT          BTC/USDT      81,406.18      +0.01%      948.19M      Live       ││                              │
+│                      ││ETHUSDT          ETH/USDT      2,399.52       +0.68%      687.33M      Live       ││Source: Binance Spot          │
+│                      ││ZECUSDT          ZEC/USDT      1,232.30       +1.32%      164.69M      Live       ││Coverage: Binance exchange    │
+│                      ││SOLUSDT          SOL/USDT      104.10         +0.62%      145.10M      Live       ││only                          │
+│                      ││USD1USDT         USD1/USDT     0.999840       -0.01%      114.26M      Live       ││Status: Live                  │
+│                      ││PEPEUSDT         PEPE/USDT     0.00000472     +7.27%      103.51M      Live       ││Event: 19:07:39.437 UTC       │
+│                      ││NEARUSDT         NEAR/USDT     4.781          -1.98%      97.96M       Live       ││Received: 19:07:39.790 UTC    │
+│                      ││XRPUSDT          XRP/USDT      1.3074         -0.00%      92.37M       Live       ││Clock skew: +195 ms (exchange │
+│                      ││BNBUSDT          BNB/USDT      743.01         +1.63%      88.23M       Live       ││ahead)                        │
+│                      ││XAUTUSDT         XAUT/USDT     3,998.54       -0.79%      82.84M       Historical ││                              │
+│                      ││SNDKBUSDT        SNDKB/USDT    1,247.21       -0.24%      52.77M       Live       ││Bid: 1.001                    │
+│                      ││SOXLBUSDT        SOXLB/USDT    83.93          +1.88%      42.31M       Live       ││Ask: 1.001                    │
+│                      ││WLDUSDT          WLD/USDT      0.525900       -7.01%      39.78M       Live       ││Spread: 0.00001 (0.0 bps)     │
+│                      ││UUSDT            U/USDT        1.0002         -0.00%      38.27M       Live       ││24h VWAP: 1.0011              │
+│                      ││DOGEUSDT         DOGE/USDT     0.079420       +1.18%      36.35M       Live       ││24h High: 1.0013              │
+│                      ││ENAUSDT          ENA/USDT      0.208900       +4.76%      35.00M       Live       ││24h Low: 1.0009               │
+│                      ││RLUSDUSDT        RLUSD/USDT    1.0011         -0.01%      34.57M       Historical ││Range pos: 20.0% of 24h range │
+│                      ││SUIUSDT          SUI/USDT      0.980800       +0.37%      27.36M       Live       ││Base Vol: 1.47B               │
+│                      ││SPCXBUSDT        SPCXB/USDT    146.24         +0.62%      27.02M       Live       ││Quote Vol: 1.47B USDT         │
+│                      ││UNIUSDT          UNI/USDT      7.102          +1.16%      23.04M       Live       ││                              │
+│                      ││TRXUSDT          TRX/USDT      0.330100       +0.60%      22.81M       Live       ││Telemetry:                    │
+│                      ││CRCLBUSDT        CRCLB/USDT    85.25          -0.19%      22.79M       Historical ││Ingest P50/95/99: 3/5/13 us   │
+│                      ││PAXGUSDT         PAXG/USDT     4,008.43       -0.78%      22.76M       Historical ││Accepted/Coalesced: 1088/0    │
+└──────────────────────┘│HYPEUSDT         HYPE/USDT     77.73          +0.09%      20.51M       Historical ││                              │
+┌ Feed Telemetry ──────┐└──────────────────────────────────────────────────────────────────────────────────┘│                              │
+│ Universe: 1383 pairs │┌ Top Gainers (24h %) ─────┐┌ Top Losers (24h %) ─────┐┌ Most Active (24h Quote Vol┐│                              │
+│ Active:   613 quotes ││ARKUSDT     0.220900 +24.6││BMTUSDT     0.022370 -17.││USDCUSDT       1.001    1.4││                              │
+│ Ingest P50/95/99: 3/5││INITUSDT    0.149200 +13.5││ALTUSDT     0.007360 -12.││BTCUSDT    81,406.18  948.1││                              │
+│ Draw P95: 0.00ms | Re││POWRUSDT    0.055800 +12.5││IOSTUSDT    0.000759 -10.││ETHUSDT     2,399.52  687.3││                              │
+└──────────────────────┘└──────────────────────────┘└─────────────────────────┘└───────────────────────────┘└──────────────────────────────┘
+ STATUS Command: MARKET USDT                                                                                                                
+ / Search  : GO>  Tab Focus  Enter Chart  u QuoteCcy  l MinVol  s Sort  o Order  m Mode  w Watch  F1 Help                                   
