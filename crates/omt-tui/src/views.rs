@@ -1,7 +1,7 @@
 use super::*;
 use omt_core::{
-    DataStatus, Filing, InstrumentInfo, Quote, TradingStatus, analyze_yield_curve, atr,
-    bollinger_bands, ema, facts, macd, portfolio::positions, rsi, sma, window_stats,
+    ChartDataStatus, DataStatus, Filing, InstrumentInfo, Quote, TradingStatus, analyze_yield_curve,
+    atr, bollinger_bands, ema, facts, macd, portfolio::positions, rsi, sma, window_stats,
 };
 use rust_decimal::{
     Decimal,
@@ -771,17 +771,17 @@ pub fn market(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled(" Quote[u]: ", Style::default().fg(SECONDARY)),
+            Span::styled(" Quote: ", Style::default().fg(SECONDARY)),
             Span::styled(
                 format!("[{}] ", app.quote_filter),
                 Style::default().fg(AMBER).bold(),
             ),
-            Span::styled("MinVol[l]: ", Style::default().fg(SECONDARY)),
+            Span::styled("MinVol: ", Style::default().fg(SECONDARY)),
             Span::styled(
                 format!("{} ", number(app.min_quote_volume)),
                 Style::default().fg(FG),
             ),
-            Span::styled("Status[x]: ", Style::default().fg(SECONDARY)),
+            Span::styled("Status: ", Style::default().fg(SECONDARY)),
             Span::styled(
                 if app.status_filter_trading_only {
                     "TRADING "
@@ -790,7 +790,7 @@ pub fn market(frame: &mut Frame, app: &App, area: Rect) {
                 },
                 Style::default().fg(FG),
             ),
-            Span::styled("Sort[s/o]: ", Style::default().fg(SECONDARY)),
+            Span::styled("Sort: ", Style::default().fg(SECONDARY)),
             Span::styled(
                 format!(
                     "{} {} ",
@@ -1076,19 +1076,19 @@ pub fn scan(frame: &mut Frame, app: &App, area: Rect) {
                         ),
                     ]),
                     Line::from(vec![
-                        Span::styled(" Mode[m]: ", Style::default().fg(SECONDARY)),
+                        Span::styled(" Mode: ", Style::default().fg(SECONDARY)),
                         Span::styled("CRYPTO ", Style::default().fg(AMBER).bold()),
-                        Span::styled("│ Quote[u]: ", Style::default().fg(SECONDARY)),
+                        Span::styled("│ Quote: ", Style::default().fg(SECONDARY)),
                         Span::styled(
                             format!("{} ", app.quote_filter),
                             Style::default().fg(AMBER).bold(),
                         ),
-                        Span::styled("│ MinVol[l]: ", Style::default().fg(SECONDARY)),
+                        Span::styled("│ MinVol: ", Style::default().fg(SECONDARY)),
                         Span::styled(
                             format!("{} ", number(app.min_quote_volume)),
                             Style::default().fg(FG),
                         ),
-                        Span::styled("│ Status[x]: ", Style::default().fg(SECONDARY)),
+                        Span::styled("│ Status: ", Style::default().fg(SECONDARY)),
                         Span::styled(
                             if app.status_filter_trading_only {
                                 "TRADING "
@@ -1097,7 +1097,7 @@ pub fn scan(frame: &mut Frame, app: &App, area: Rect) {
                             },
                             Style::default().fg(FG),
                         ),
-                        Span::styled("│ Sort[s/o]: ", Style::default().fg(SECONDARY)),
+                        Span::styled("│ Sort: ", Style::default().fg(SECONDARY)),
                         Span::styled(
                             format!(
                                 "{} {} ",
@@ -1106,7 +1106,7 @@ pub fn scan(frame: &mut Frame, app: &App, area: Rect) {
                             ),
                             Style::default().fg(AMBER).bold(),
                         ),
-                        Span::styled("│ Filter(:FILTER): ", Style::default().fg(SECONDARY)),
+                        Span::styled("│ Filter: ", Style::default().fg(SECONDARY)),
                         Span::styled(
                             if app.filter.is_empty() {
                                 "none"
@@ -1179,9 +1179,9 @@ pub fn scan(frame: &mut Frame, app: &App, area: Rect) {
                         ),
                     ]),
                     Line::from(vec![
-                        Span::styled(" Mode[m]: ", Style::default().fg(SECONDARY)),
+                        Span::styled(" Mode: ", Style::default().fg(SECONDARY)),
                         Span::styled("EQUITIES ", Style::default().fg(AMBER).bold()),
-                        Span::styled("│ Sort[s/o]: ", Style::default().fg(SECONDARY)),
+                        Span::styled("│ Sort: ", Style::default().fg(SECONDARY)),
                         Span::styled(
                             format!(
                                 "{} {} ",
@@ -1337,7 +1337,17 @@ pub fn financials(frame: &mut Frame, app: &App, area: Rect) {
     };
     let table = facts::comparative_table(&company.facts, app.period, app.stmt_tab);
     let summary = facts::summarize(&company.facts, app.period);
-    let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(6)]).split(area);
+    let stmt_h = (table.rows.len() as u16 + 3).clamp(7, 12);
+    let rows = if area.height >= 18 {
+        Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(stmt_h),
+            Constraint::Min(6),
+        ])
+        .split(area)
+    } else {
+        Layout::vertical([Constraint::Length(3), Constraint::Min(6)]).split(area)
+    };
 
     let mut tab_spans = vec![
         Span::styled(
@@ -1347,10 +1357,7 @@ pub fn financials(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Style::default().fg(AMBER).bold(),
         ),
-        Span::styled(
-            format!("│ {:?} [a/v] │ ", app.period),
-            Style::default().fg(FG),
-        ),
+        Span::styled(format!("│ {:?} │ ", app.period), Style::default().fg(FG)),
     ];
     for tab in StatementTab::ALL {
         let active = tab == app.stmt_tab;
@@ -1457,6 +1464,220 @@ pub fn financials(frame: &mut Frame, app: &App, area: Rect) {
         rows[1],
         &mut state,
     );
+
+    if rows.len() > 2 && rows[2].height >= 4 {
+        render_fin_secondary_analysis(
+            frame,
+            app,
+            rows[2],
+            company,
+            &table,
+            &shown_periods,
+            active_col,
+        );
+    }
+}
+
+fn render_fin_secondary_analysis(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    company: &Company,
+    table: &facts::ComparativeTable,
+    shown_periods: &[chrono::NaiveDate],
+    active_col: usize,
+) {
+    let sel_idx = app.cursor.min(table.rows.len().saturating_sub(1));
+    let sel_row = table.rows.get(sel_idx);
+    let sel_metric = sel_row.map(|r| r.metric).unwrap_or("Revenue");
+    let audit = facts::metric_audit(&company.facts, app.period, sel_metric);
+    let sel_fact = sel_row.and_then(|r| r.sources.get(active_col).copied().flatten());
+
+    let cols = if area.width >= 120 {
+        Layout::horizontal([
+            Constraint::Percentage(34),
+            Constraint::Percentage(36),
+            Constraint::Percentage(30),
+        ])
+        .split(area)
+    } else {
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area)
+    };
+
+    // 1. Metric Historical Trajectory & Sparkline
+    let mut trend_lines = vec![
+        Line::from(vec![Span::styled(
+            format!(" HISTORICAL TRAJECTORY: {sel_metric} "),
+            Style::default().fg(BG).bg(AMBER).bold(),
+        )]),
+        Line::from(""),
+    ];
+
+    if let Some(ref a) = audit {
+        let max_val = a.max_value.unwrap_or(Decimal::ONE);
+        let min_val = a.min_value.unwrap_or(Decimal::ZERO);
+        let bar_width = 16usize;
+
+        for pt in &a.points {
+            let ratio = if max_val > Decimal::ZERO {
+                ((pt.value / max_val).to_f64().unwrap_or(0.0)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let filled = (ratio * bar_width as f64).round() as usize;
+            let empty = bar_width.saturating_sub(filled);
+            let bar_str = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+
+            trend_lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {:<8} ", pt.period_label),
+                    Style::default().fg(AMBER),
+                ),
+                Span::styled(
+                    format!("{:>14} ", number(pt.value)),
+                    Style::default().fg(FG).bold(),
+                ),
+                Span::styled(bar_str, Style::default().fg(theme::CYAN)),
+            ]));
+        }
+        trend_lines.push(Line::from(""));
+        let yoy_str = a
+            .latest_yoy_pct
+            .map(|y| format!("{y:+.1}%"))
+            .unwrap_or_else(|| "--".into());
+        trend_lines.push(Line::from(vec![
+            Span::styled(" Range: ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                format!("{} to {}", number(min_val), number(max_val)),
+                Style::default().fg(FG),
+            ),
+            Span::styled(" │ Latest YoY: ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                yoy_str,
+                Style::default()
+                    .fg(theme::direction_color(a.latest_yoy_pct))
+                    .bold(),
+            ),
+        ]));
+    } else {
+        trend_lines.push(Line::from(Span::styled(
+            "Derived ratio metric — computed from comparative primary statement records.",
+            Style::default().fg(SECONDARY),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(trend_lines).block(block(format!(" Metric Trend ({}) ", sel_metric), false)),
+        cols[0],
+    );
+
+    // 2. XBRL Fact Audit & Exact Unrounded Values
+    let mut audit_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                " XBRL FACT AUDIT ",
+                Style::default().fg(BG).bg(AMBER).bold(),
+            ),
+            Span::styled(
+                format!(" Period: {:?} ", shown_periods.get(active_col)),
+                Style::default().fg(SECONDARY),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    if let Some(fact) = sel_fact {
+        audit_lines.push(Line::from(vec![
+            Span::styled("Exact Reported Value: ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                format!("{} {}", fact.value, fact.unit),
+                Style::default().fg(FG).bold(),
+            ),
+        ]));
+        audit_lines.push(Line::from(vec![
+            Span::styled("US-GAAP Taxonomy Tag: ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                format!("us-gaap:{}", fact.concept),
+                Style::default().fg(theme::CYAN).bold(),
+            ),
+        ]));
+        audit_lines.push(Line::from(vec![
+            Span::styled("Reporting Interval:   ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                format!(
+                    "{} -> {} ({})",
+                    fact.start
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "Point-in-Time".into()),
+                    fact.end,
+                    if fact.start.is_some() {
+                        "Duration Flow"
+                    } else {
+                        "Instant Balance"
+                    }
+                ),
+                Style::default().fg(FG),
+            ),
+        ]));
+        audit_lines.push(Line::from(vec![
+            Span::styled("Filing Form & Date:   ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                format!("Form {} │ Filed {}", fact.form, fact.filed),
+                Style::default().fg(AMBER),
+            ),
+        ]));
+        audit_lines.push(Line::from(vec![
+            Span::styled("SEC Accession Number: ", Style::default().fg(SECONDARY)),
+            Span::styled(fact.accession.clone(), Style::default().fg(MUTED)),
+        ]));
+        audit_lines.push(Line::from(vec![
+            Span::styled("Provenance Archive:   ", Style::default().fg(SECONDARY)),
+            Span::styled(fact.source.clone(), Style::default().fg(POSITIVE)),
+        ]));
+    } else {
+        audit_lines.push(Line::from(Span::styled(
+            format!("No standalone primary XBRL fact for '{sel_metric}' in this period.\nConsolidated via standard GAAP comparative period accounting."),
+            Style::default().fg(SECONDARY),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(audit_lines).block(block(" Fact Audit & XBRL Provenance ", false)),
+        cols[1],
+    );
+
+    // 3. SEC Filings History Archive
+    if cols.len() > 2 {
+        let max_filings = cols[2].height.saturating_sub(4).max(1) as usize;
+        let filing_rows = company.filings.iter().take(max_filings).map(|f| {
+            Row::new(vec![
+                Cell::from(f.form.clone()).style(Style::default().fg(AMBER).bold()),
+                Cell::from(f.filed.format("%Y-%m-%d").to_string()).style(Style::default().fg(FG)),
+                Cell::from(
+                    f.report_date
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "--".into()),
+                )
+                .style(Style::default().fg(SECONDARY)),
+                Cell::from(f.description.clone()).style(Style::default().fg(MUTED)),
+            ])
+        });
+
+        frame.render_widget(
+            Table::new(
+                filing_rows,
+                [
+                    Constraint::Length(8),
+                    Constraint::Length(12),
+                    Constraint::Length(12),
+                    Constraint::Min(12),
+                ],
+            )
+            .header(Row::new(["FORM", "FILED", "REPORT", "DOCUMENT"]).style(theme::header_style()))
+            .block(block(" SEC Filings Archive (Press 'o' to open) ", false)),
+            cols[2],
+        );
+    }
 }
 
 fn render_security_description(frame: &mut Frame, app: &App, area: Rect, company: &Company) {
@@ -1485,16 +1706,10 @@ fn render_security_description(frame: &mut Frame, app: &App, area: Rect, company
                 Style::default().fg(FG),
             ),
         ]),
-        Line::from(vec![
-            Span::styled(
-                " Jurisdiction: SEC EDGAR US GAAP XBRL │ Currency: USD │ Verified Financial Reporting",
-                Style::default().fg(SECONDARY),
-            ),
-            Span::styled(
-                " │ Press 'd' to toggle Comparative Statements",
-                Style::default().fg(AMBER),
-            ),
-        ]),
+        Line::from(vec![Span::styled(
+            " Jurisdiction: SEC EDGAR US GAAP XBRL │ Currency: USD │ Verified Financial Reporting",
+            Style::default().fg(SECONDARY),
+        )]),
     ];
     frame.render_widget(
         Paragraph::new(hdr).style(Style::default().bg(ELEVATED_BG)),
@@ -1652,16 +1867,10 @@ fn render_crypto_security_description(frame: &mut Frame, app: &App, area: Rect) 
                 Style::default().fg(FG),
             ),
         ]),
-        Line::from(vec![
-            Span::styled(
-                " Market Coverage: Binance Spot Global Exchange Feed │ Verified Pricing Feed",
-                Style::default().fg(SECONDARY),
-            ),
-            Span::styled(
-                " │ Press 'd' to toggle Candlestick Chart",
-                Style::default().fg(AMBER),
-            ),
-        ]),
+        Line::from(vec![Span::styled(
+            " Market Coverage: Binance Spot Global Exchange Feed │ Verified Pricing Feed",
+            Style::default().fg(SECONDARY),
+        )]),
     ];
     frame.render_widget(
         Paragraph::new(hdr).style(Style::default().bg(ELEVATED_BG)),
@@ -1793,9 +2002,9 @@ pub fn news(frame: &mut Frame, app: &App, area: Rect) {
     }
     cat_spans.push(Span::styled("│ ", Style::default().fg(BORDER)));
     let ticker_badge = if let Some(ref t) = app.news_ticker_filter {
-        format!("[TICKER: {t} (press t to clear)]")
+        format!("[TICKER: {t}]")
     } else {
-        format!("[ALL TICKERS (press t to lock {})]", app.asset.base_asset())
+        "[ALL TICKERS]".to_string()
     };
     cat_spans.push(Span::styled(
         ticker_badge,
@@ -1804,7 +2013,7 @@ pub fn news(frame: &mut Frame, app: &App, area: Rect) {
     cat_spans.push(Span::raw(" "));
     if active_cat == NewsCategory::Filings || app.company.is_some() {
         cat_spans.push(Span::styled(
-            format!("[FORM: {} (f)] ", app.filing_form_filter),
+            format!("[FORM: {}] ", app.filing_form_filter),
             Style::default().fg(SECONDARY),
         ));
     }
@@ -1819,16 +2028,10 @@ pub fn news(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    let sub_banner = Line::from(vec![
-        Span::styled(
-            " Sources: Yahoo Finance · CNBC · Federal Reserve · CoinDesk/Cointelegraph · SEC EDGAR │ ",
-            Style::default().fg(SECONDARY),
-        ),
-        Span::styled(
-            "c: Category │ t: Ticker │ f: Form │ Enter/r: Read Story │ [/]: Scroll │ o: Browser │ R: Refresh",
-            Style::default().fg(AMBER),
-        ),
-    ]);
+    let sub_banner = Line::from(vec![Span::styled(
+        " Sources: Yahoo Finance · CNBC · Federal Reserve · CoinDesk/Cointelegraph · SEC EDGAR │ Verified Reporting",
+        Style::default().fg(SECONDARY),
+    )]);
 
     frame.render_widget(
         Paragraph::new(vec![Line::from(cat_spans), sub_banner])
@@ -1858,6 +2061,16 @@ pub fn news(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.news_reader_expanded {
         render_news_reader_pane(frame, app, rows[1], selected_item.as_ref(), true);
+    } else if rows[1].width >= 125 {
+        let cols = Layout::horizontal([
+            Constraint::Percentage(40),
+            Constraint::Percentage(36),
+            Constraint::Percentage(24),
+        ])
+        .split(rows[1]);
+        render_news_table(frame, app, cols[0], &items, selected_idx);
+        render_news_reader_pane(frame, app, cols[1], selected_item.as_ref(), false);
+        render_news_context_pane(frame, app, cols[2], selected_item.as_ref());
     } else if rows[1].width >= 88 {
         let cols = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
             .split(rows[1]);
@@ -2089,6 +2302,132 @@ fn render_news_reader_pane(
     );
 }
 
+fn render_news_context_pane(
+    frame: &mut Frame,
+    _app: &App,
+    area: Rect,
+    item: Option<&omt_core::NewsItem>,
+) {
+    let Some(item) = item else {
+        frame.render_widget(
+            Paragraph::new("Select a news story to inspect publisher context.")
+                .style(Style::default().fg(SECONDARY))
+                .block(block(" Story Context ", false)),
+            area,
+        );
+        return;
+    };
+
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            " PUBLISHER CONTEXT ",
+            Style::default().fg(BG).bg(AMBER).bold(),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Publisher: ", Style::default().fg(SECONDARY)),
+            Span::styled(item.source.clone(), Style::default().fg(FG).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled("Category:  ", Style::default().fg(SECONDARY)),
+            Span::styled(item.category.label(), Style::default().fg(AMBER)),
+        ]),
+        Line::from(vec![
+            Span::styled("Ticker:    ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                item.ticker.as_deref().unwrap_or("GLOBAL"),
+                Style::default().fg(FG).bold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Published: ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                item.published_at
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string(),
+                Style::default().fg(FG),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    if item.is_sec_filing {
+        lines.push(Line::from(Span::styled(
+            "SEC EDGAR Provenance:",
+            Style::default().fg(theme::CYAN).bold(),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("Form:      ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                item.form.as_deref().unwrap_or("EDGAR"),
+                Style::default().fg(AMBER).bold(),
+            ),
+        ]));
+        if let Some(ref acc) = item.accession {
+            lines.push(Line::from(vec![
+                Span::styled("Accession: ", Style::default().fg(SECONDARY)),
+                Span::styled(acc.clone(), Style::default().fg(MUTED)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    let extraction_status = if item.body.is_some() {
+        "FULL ARTICLE EXTRACTED"
+    } else {
+        "FEED SUMMARY / EXCERPT"
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("Reader State: ", Style::default().fg(SECONDARY)),
+        Span::styled(
+            extraction_status,
+            Style::default()
+                .fg(if item.body.is_some() { POSITIVE } else { AMBER })
+                .bold(),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(
+        "Available Shortcuts:",
+        Style::default().fg(SECONDARY),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled(" [Enter/r] ", theme::keycap_style()),
+        Span::styled(" Read / Expand", theme::keycap_label_style()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" [o]       ", theme::keycap_style()),
+        Span::styled(" Open in Browser", theme::keycap_label_style()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" [c]       ", theme::keycap_style()),
+        Span::styled(" Cycle Category", theme::keycap_label_style()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" [t]       ", theme::keycap_style()),
+        Span::styled(" Filter by Ticker", theme::keycap_label_style()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" [R]       ", theme::keycap_style()),
+        Span::styled(" Refresh Feeds", theme::keycap_label_style()),
+    ]));
+
+    let block_title = if area.width >= 30 {
+        " Story Context & Provenance "
+    } else {
+        " Story Context "
+    };
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block(block_title, false)),
+        area,
+    );
+}
+
 pub fn portfolio(frame: &mut Frame, app: &App, area: Rect) {
     let transactions: Vec<_> = app
         .transactions
@@ -2295,7 +2634,198 @@ pub fn portfolio(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     if rows[2].height > 0 {
-        let max_tx = rows[2].height.saturating_sub(3).max(1) as usize;
+        let sel_pos_idx = app.cursor.min(positions.len().saturating_sub(1));
+        let sel_pos = positions.get(sel_pos_idx);
+
+        let cols = if rows[2].width >= 120 {
+            Layout::horizontal([
+                Constraint::Percentage(28),
+                Constraint::Percentage(34),
+                Constraint::Percentage(38),
+            ])
+            .split(rows[2])
+        } else {
+            Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+                .split(rows[2])
+        };
+
+        // Subpanel 1: Text-Based Asset Allocation Bar
+        let _total_cost_sum: Decimal = totals.values().map(|(_, c, ..)| *c).sum();
+        let total_mv_sum: Decimal = totals.values().map(|(mv, ..)| *mv).sum();
+        let bar_len = (cols[0].width.saturating_sub(6) as usize).clamp(8, 28);
+        let mut bar_spans = Vec::new();
+
+        if positions.len() == 1 {
+            let p = &positions[0];
+            bar_spans.push(Span::styled(
+                format!(" [{}] 100% ", p.asset.symbol),
+                Style::default().fg(AMBER).bold(),
+            ));
+            bar_spans.push(Span::styled(
+                "█".repeat(bar_len),
+                Style::default().fg(AMBER),
+            ));
+        } else if total_mv_sum > Decimal::ZERO {
+            bar_spans.push(Span::styled(" [", Style::default().fg(SECONDARY)));
+            let colors = [
+                AMBER,
+                theme::CYAN,
+                POSITIVE,
+                Color::Rgb(255, 153, 51),
+                Color::Rgb(102, 204, 204),
+            ];
+            for (i, p) in positions.iter().enumerate() {
+                let q = app.market.quotes.get(&p.asset.key());
+                let mv = q.map(|q| p.quantity * q.price).unwrap_or(Decimal::ZERO);
+                let ratio = (mv / total_mv_sum).to_f64().unwrap_or(0.0).clamp(0.0, 1.0);
+                let chars = (ratio * bar_len as f64).round() as usize;
+                let color = colors[i % colors.len()];
+                if chars > 0 {
+                    bar_spans.push(Span::styled("█".repeat(chars), Style::default().fg(color)));
+                }
+            }
+            bar_spans.push(Span::styled("]", Style::default().fg(SECONDARY)));
+        }
+
+        let mut alloc_lines = vec![
+            Line::from(vec![Span::styled(
+                " ASSET ALLOCATION ",
+                Style::default().fg(BG).bg(AMBER).bold(),
+            )]),
+            Line::from(""),
+            Line::from(bar_spans),
+            Line::from(""),
+        ];
+
+        for p in &positions {
+            let q = app.market.quotes.get(&p.asset.key());
+            let mv = q.map(|q| p.quantity * q.price).unwrap_or(Decimal::ZERO);
+            let pct_str = if total_mv_sum > Decimal::ZERO {
+                format!("{:.1}%", mv / total_mv_sum * Decimal::from(100))
+            } else {
+                "--".into()
+            };
+            alloc_lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {:<8} ", p.asset.symbol),
+                    Style::default().fg(AMBER),
+                ),
+                Span::styled(
+                    format!("{:>10} ", number(mv)),
+                    Style::default().fg(FG).bold(),
+                ),
+                Span::styled(format!("({pct_str})"), Style::default().fg(SECONDARY)),
+            ]));
+        }
+
+        frame.render_widget(
+            Paragraph::new(alloc_lines).block(block(" Portfolio Allocation ", false)),
+            cols[0],
+        );
+
+        // Subpanel 2: Selected Position Deep Dive
+        if cols.len() > 2 {
+            let mut detail_lines = vec![
+                Line::from(vec![
+                    Span::styled(
+                        " POSITION DETAILS ",
+                        Style::default().fg(BG).bg(AMBER).bold(),
+                    ),
+                    Span::styled(
+                        format!(" {} ", sel_pos.map(|p| p.asset.key()).unwrap_or_default()),
+                        Style::default().fg(SECONDARY),
+                    ),
+                ]),
+                Line::from(""),
+            ];
+
+            if let Some(p) = sel_pos {
+                let q = app.market.quotes.get(&p.asset.key());
+                let valid_q = q
+                    .filter(|q| matches!(q.status_at(now), DataStatus::Live | DataStatus::Delayed));
+                let mv = valid_q.map(|q| p.quantity * q.price);
+                let unreal = valid_q.and_then(|q| p.unrealized(q.price, &q.currency));
+                let unreal_pct = valid_q.and_then(|q| p.unrealized_pct(q.price, &q.currency));
+
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Position Size:   ", Style::default().fg(SECONDARY)),
+                    Span::styled(
+                        format!("{} {}", number(p.quantity), p.asset.symbol),
+                        Style::default().fg(FG).bold(),
+                    ),
+                ]));
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Average Cost:    ", Style::default().fg(SECONDARY)),
+                    Span::styled(
+                        p.average_cost()
+                            .map(format_price)
+                            .unwrap_or_else(|| "--".into()),
+                        Style::default().fg(AMBER),
+                    ),
+                ]));
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Current Price:   ", Style::default().fg(SECONDARY)),
+                    Span::styled(
+                        q.map(|q| format_price(q.price))
+                            .unwrap_or_else(|| "unavailable".into()),
+                        Style::default().fg(FG).bold(),
+                    ),
+                ]));
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Total Cost Basis:", Style::default().fg(SECONDARY)),
+                    Span::styled(
+                        format!("{} {}", number(p.cost), p.currency),
+                        Style::default().fg(FG),
+                    ),
+                ]));
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Market Value:    ", Style::default().fg(SECONDARY)),
+                    Span::styled(
+                        mv.map(number).unwrap_or_else(|| "unavailable".into()),
+                        Style::default().fg(FG).bold(),
+                    ),
+                ]));
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Unrealized P&L:  ", Style::default().fg(SECONDARY)),
+                    Span::styled(
+                        unreal
+                            .map(format_signed_price)
+                            .unwrap_or_else(|| "--".into()),
+                        Style::default().fg(theme::direction_color(unreal)).bold(),
+                    ),
+                    Span::styled(
+                        unreal_pct
+                            .map(|p| format!(" ({p:+.2}%)"))
+                            .unwrap_or_default(),
+                        Style::default().fg(theme::direction_color(unreal)),
+                    ),
+                ]));
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Realized Profit: ", Style::default().fg(SECONDARY)),
+                    Span::styled(
+                        format_signed_price(p.realized),
+                        Style::default().fg(theme::direction_color(Some(p.realized))),
+                    ),
+                ]));
+                detail_lines.push(Line::from(vec![
+                    Span::styled("Quote Freshness: ", Style::default().fg(SECONDARY)),
+                    Span::styled(
+                        q.map(|q| format!("{:?} ({})", q.status_at(now), q.provider))
+                            .unwrap_or_else(|| "No Quote Feed".into()),
+                        Style::default().fg(MUTED),
+                    ),
+                ]));
+            }
+
+            frame.render_widget(
+                Paragraph::new(detail_lines).block(block(" Holding Deep Dive ", false)),
+                cols[1],
+            );
+        }
+
+        // Subpanel 3: Execution Blotter Table
+        let blotter_idx = if cols.len() > 2 { 2 } else { 1 };
+        let max_tx = cols[blotter_idx].height.saturating_sub(3).max(1) as usize;
         let tx_rows = transactions.iter().rev().take(max_tx).map(|t| {
             let side_color = if t.side == omt_core::portfolio::Side::Buy {
                 POSITIVE
@@ -2333,7 +2863,7 @@ pub fn portfolio(frame: &mut Frame, app: &App, area: Rect) {
                 " Execution Blotter / Recent Fills (:DELTX <id>) ",
                 false,
             )),
-            rows[2],
+            cols[blotter_idx],
         );
     }
 }
@@ -2406,53 +2936,83 @@ pub fn economics(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     let treasury = first.source == "US Treasury";
-    let mut data: Vec<_> = app
-        .macro_data
-        .iter()
-        .take(100)
-        .filter_map(|r| Some((macro_x(r)?, r.value.to_f64()?)))
-        .collect();
-    data.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let selected_idx = app.cursor.min(app.macro_data.len().saturating_sub(1));
+    let (data, xmin, xmax, x_labels, selected_point) = if treasury && app.econ_axis_categorical {
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        for (i, r) in app.macro_data.iter().take(100).enumerate() {
+            if let Some(v) = r.value.to_f64() {
+                pts.push((i as f64, v));
+            }
+        }
+        let xmax = pts.len().saturating_sub(1).max(1) as f64;
+        let mut labels = Vec::new();
+        for (i, r) in app.macro_data.iter().take(100).enumerate() {
+            if i == 0
+                || i == 2
+                || i == 4
+                || i == 5
+                || i == 6
+                || i == 8
+                || i == 10
+                || i == pts.len().saturating_sub(1)
+            {
+                labels.push(r.label.clone());
+            }
+        }
+        let sel_pt: Vec<(f64, f64)> = app
+            .macro_data
+            .get(selected_idx)
+            .and_then(|r| Some((selected_idx as f64, r.value.to_f64()?)))
+            .into_iter()
+            .collect();
+        (pts, 0.0, xmax, labels, sel_pt)
+    } else {
+        let mut pts: Vec<_> = app
+            .macro_data
+            .iter()
+            .take(100)
+            .filter_map(|r| Some((macro_x(r)?, r.value.to_f64()?)))
+            .collect();
+        pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let xmin = pts.first().map(|p| p.0).unwrap_or(0.0);
+        let xmax = pts.last().map(|p| p.0).unwrap_or(1.0).max(xmin + 1.0);
+        let labels = if treasury {
+            vec![
+                "1M (0.1y)".to_string(),
+                "5Y".to_string(),
+                "10Y".to_string(),
+                "20Y".to_string(),
+                format!("{:.0}Y", xmax / 12.0),
+            ]
+        } else {
+            let d_min = app
+                .macro_data
+                .iter()
+                .map(|r| r.date.clone())
+                .min()
+                .unwrap_or_default();
+            let d_max = app
+                .macro_data
+                .iter()
+                .map(|r| r.date.clone())
+                .max()
+                .unwrap_or_default();
+            vec![d_min, d_max]
+        };
+        let sel_pt: Vec<(f64, f64)> = app
+            .macro_data
+            .get(selected_idx)
+            .and_then(|r| Some((macro_x(r)?, r.value.to_f64()?)))
+            .into_iter()
+            .collect();
+        (pts, xmin, xmax, labels, sel_pt)
+    };
     if data.is_empty() {
         return;
     }
-    let xmin = data[0].0;
-    let xmax = data[data.len() - 1].0.max(xmin + 1.0);
     let min = data.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
     let max = data.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
     let pad = ((max - min) * 0.12).max(0.05);
-
-    let selected_idx = app.cursor.min(app.macro_data.len() - 1);
-    let selected_point: Vec<(f64, f64)> = app
-        .macro_data
-        .get(selected_idx)
-        .and_then(|r| Some((macro_x(r)?, r.value.to_f64()?)))
-        .into_iter()
-        .collect();
-
-    let x_labels = if treasury {
-        vec![
-            "1M (0.1y)".to_string(),
-            "5Y".to_string(),
-            "10Y".to_string(),
-            "20Y".to_string(),
-            format!("{:.0}Y", xmax / 12.0),
-        ]
-    } else {
-        let d_min = app
-            .macro_data
-            .iter()
-            .map(|r| r.date.clone())
-            .min()
-            .unwrap_or_default();
-        let d_max = app
-            .macro_data
-            .iter()
-            .map(|r| r.date.clone())
-            .max()
-            .unwrap_or_default();
-        vec![d_min, d_max]
-    };
     let mid = (min + max) * 0.5;
     let chart = Chart::new(vec![
         Dataset::default()
@@ -2498,9 +3058,16 @@ pub fn economics(frame: &mut Frame, app: &App, area: Rect) {
     ]))
     .block(block(
         if treasury {
-            " US Treasury Par Yield Curve (Proportional Maturity Axis) — j/k to Inspect Tenor "
+            format!(
+                " US Treasury Par Yield Curve ({}) — m: Toggle Axis Mode │ j/k: Inspect Tenor ",
+                if app.econ_axis_categorical {
+                    "Categorical Tenor Spacing"
+                } else {
+                    "Proportional Maturity Axis"
+                }
+            )
         } else {
-            " Historical Macroeconomic Series (Chronological) "
+            " Historical Macroeconomic Series (Chronological) ".into()
         },
         app.focus == 1,
     ));
@@ -2591,6 +3158,185 @@ fn unavailable(frame: &mut Frame, app: &App, area: Rect, text: &str) {
     );
 }
 
+pub fn render_market_pulse_card(frame: &mut Frame, app: &App, area: Rect, active: bool) {
+    let btc_q = app.market.quotes.get("BINANCE:BTCUSDT");
+    let eth_q = app.market.quotes.get("BINANCE:ETHUSDT");
+    let sol_q = app.market.quotes.get("BINANCE:SOLUSDT");
+
+    let status_desc = match app.market.chart_status {
+        ChartDataStatus::AuthenticationRequired => {
+            format!(
+                "Chart for {}: Set APCA_API_KEY_ID in :SETTINGS for live equity candles",
+                app.asset.key()
+            )
+        }
+        ChartDataStatus::Error => {
+            let err = app.market.chart_error.as_deref().unwrap_or("Network error");
+            format!("Chart for {}: {err} (Press 'R' to retry)", app.asset.key())
+        }
+        ChartDataStatus::Unsupported => {
+            format!(
+                "Chart for {}: Unsupported timeframe or venue",
+                app.asset.key()
+            )
+        }
+        _ => {
+            format!(
+                "Chart for {}: Press 'R' to refresh or :CHART BTCUSDT",
+                app.asset.key()
+            )
+        }
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                " MARKET PULSE & BENCHMARKS ",
+                Style::default().fg(BG).bg(AMBER).bold(),
+            ),
+            Span::styled(
+                format!("  {} ", status_desc),
+                Style::default().fg(SECONDARY),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    let fmt_quote = |sym: &str, q: Option<&Quote>| -> Vec<Span<'static>> {
+        if let Some(q) = q {
+            let chg_pct = q.effective_change_pct();
+            let color = theme::direction_color(chg_pct);
+            let arrow = match chg_pct {
+                Some(p) if p > Decimal::ZERO => "▲ +",
+                Some(p) if p < Decimal::ZERO => "▼ ",
+                _ => "  ",
+            };
+            let pct_str = chg_pct
+                .map(|p| format!("{p:.2}%"))
+                .unwrap_or_else(|| "--".into());
+            vec![
+                Span::styled(format!(" {sym}: "), Style::default().fg(FG).bold()),
+                Span::styled(
+                    format!("{} ", format_price(q.price)),
+                    Style::default().fg(FG),
+                ),
+                Span::styled(
+                    format!("{arrow}{pct_str} "),
+                    Style::default().fg(color).bold(),
+                ),
+                Span::styled(" │ ", Style::default().fg(theme::INACTIVE_BORDER)),
+            ]
+        } else {
+            vec![
+                Span::styled(format!(" {sym}: "), Style::default().fg(MUTED)),
+                Span::styled("waiting for feed │ ", Style::default().fg(MUTED)),
+            ]
+        }
+    };
+
+    let mut benchmark_spans = Vec::new();
+    benchmark_spans.extend(fmt_quote("BTC", btc_q));
+    benchmark_spans.extend(fmt_quote("ETH", eth_q));
+    benchmark_spans.extend(fmt_quote("SOL", sol_q));
+    lines.push(Line::from(benchmark_spans));
+    lines.push(Line::from(""));
+
+    let mut advancers = 0usize;
+    let mut decliners = 0usize;
+    let mut total_vol = Decimal::ZERO;
+    for q in app.market.quotes.values() {
+        if let Some(p) = q.effective_change_pct() {
+            if p > Decimal::ZERO {
+                advancers += 1;
+            } else if p < Decimal::ZERO {
+                decliners += 1;
+            }
+        }
+        if let Some(qv) = q.quote_volume {
+            total_vol += qv;
+        }
+    }
+    let total_active = advancers + decliners;
+    let adv_pct = if total_active > 0 {
+        (advancers as f64 / total_active as f64) * 100.0
+    } else {
+        50.0
+    };
+
+    let bar_len = (area.width.saturating_sub(26) as usize).clamp(10, 36);
+    let adv_chars = ((adv_pct / 100.0) * bar_len as f64).round() as usize;
+    let dec_chars = bar_len.saturating_sub(adv_chars);
+
+    lines.push(Line::from(vec![
+        Span::styled(" Market Breadth: ", Style::default().fg(SECONDARY)),
+        Span::styled(
+            format!("+{advancers} "),
+            Style::default().fg(POSITIVE).bold(),
+        ),
+        Span::styled("█".repeat(adv_chars), Style::default().fg(POSITIVE)),
+        Span::styled("█".repeat(dec_chars), Style::default().fg(NEGATIVE)),
+        Span::styled(
+            format!(" -{decliners} "),
+            Style::default().fg(NEGATIVE).bold(),
+        ),
+        Span::styled(
+            format!("({adv_pct:.0}% adv) │ Vol: {} USDT", number(total_vol)),
+            Style::default().fg(SECONDARY),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    let mut sorted_quotes: Vec<&Quote> = app.market.quotes.values().collect();
+    sorted_quotes.sort_by(|a, b| {
+        let pa = a.effective_change_pct().unwrap_or(Decimal::ZERO);
+        let pb = b.effective_change_pct().unwrap_or(Decimal::ZERO);
+        pb.cmp(&pa)
+    });
+
+    lines.push(Line::from(vec![
+        Span::styled(" Top Gainers: ", Style::default().fg(POSITIVE).bold()),
+        Span::styled(
+            sorted_quotes
+                .iter()
+                .take(3)
+                .map(|q| {
+                    let p = q.effective_change_pct().unwrap_or_default();
+                    format!("{} {:+.1}%", q.base_symbol(), p)
+                })
+                .collect::<Vec<_>>()
+                .join("  ·  "),
+            Style::default().fg(FG),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" Top Decliners: ", Style::default().fg(NEGATIVE).bold()),
+        Span::styled(
+            sorted_quotes
+                .iter()
+                .rev()
+                .take(3)
+                .map(|q| {
+                    let p = q.effective_change_pct().unwrap_or_default();
+                    format!("{} {:+.1}%", q.base_symbol(), p)
+                })
+                .collect::<Vec<_>>()
+                .join("  ·  "),
+            Style::default().fg(FG),
+        ),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(block(
+            format!(
+                " LAUNCHPAD: Market Pulse & Diagnostics ({}) — 'R' to Retry Chart ",
+                app.asset.key()
+            ),
+            active,
+        )),
+        area,
+    );
+}
+
 pub fn chart(frame: &mut Frame, app: &App, area: Rect) {
     if app.des_mode {
         if let Some(company) = &app.company {
@@ -2615,13 +3361,20 @@ impl Widget for CandleChart<'_> {
         } else {
             "HIST PAN"
         };
+        let stale_badge = if app.market.chart_status == ChartDataStatus::Stale {
+            " │ [STALE CACHE - Press R to refresh]"
+        } else {
+            ""
+        };
         let outer = block(
             format!(
-                " {} <GP> │ {} │ {} │ {} │ Overlay[i]: {} │ Sub[g]: {} ",
+                " {} <GP> │ {} │ {} │ {}{}{} │ Overlay: {} │ Sub: {} ",
                 app.asset.key(),
                 app.timeframe,
                 app.asset.currency(),
                 live_label,
+                stale_badge,
+                "",
                 app.overlay.label(),
                 app.sub_indicator.label()
             ),
@@ -2633,18 +3386,103 @@ impl Widget for CandleChart<'_> {
             return;
         }
         if app.market.candles.is_empty() {
-            Paragraph::new(
-                "No historical candles loaded for this instrument.\n\
-                 Waiting for provider response or local SQLite cache.\n\
-                 Controls:\n\
-                 • t: Timeframe (1m, 5m, 15m, 1h, 4h, 1d)\n\
-                 • i: Overlay (SMA, EMA, Bollinger, None)\n\
-                 • g: Sub-Indicator (Volume, RSI, MACD, ATR)\n\
-                 • +/-: Zoom in / Zoom out\n\
-                 • h/l: Pan historical bars",
-            )
-            .style(Style::default().fg(SECONDARY))
-            .render(inner, buf);
+            let msg = match app.market.chart_status {
+                ChartDataStatus::AuthenticationRequired => {
+                    format!(
+                        "AUTHENTICATION REQUIRED FOR EQUITY DATA\n\n\
+                         {} historical candles unavailable — configure required Alpaca IEX credentials.\n\n\
+                         Instructions:\n\
+                         • Set APCA_API_KEY_ID in :SETTINGS or system environment\n\
+                         • Set APCA_API_SECRET_KEY for Alpaca IEX data feed\n\n\
+                         Alternative Feeds:\n\
+                         • Run :CHART BTCUSDT (Binance Spot public discovery)\n\
+                         • Run :CHART COINBASE:BTC-USD (Coinbase public exchange)\n\
+                         • Run :FIN {} (SEC EDGAR public XBRL fundamentals)\n\n\
+                         Press 'R' to retry after setting credentials.",
+                        app.asset.key(),
+                        app.asset.symbol
+                    )
+                }
+                ChartDataStatus::Loading => {
+                    format!(
+                        "LOADING HISTORICAL CANDLES\n\n\
+                         Fetching {} {} bars from {}...\n\
+                         Waiting for provider response and local SQLite cache synchronization.\n\n\
+                         Press 'R' to re-request candles or 't' to change timeframe.",
+                        app.asset.key(),
+                        app.timeframe,
+                        app.asset.venue
+                    )
+                }
+                ChartDataStatus::Unsupported => {
+                    format!(
+                        "UNSUPPORTED TIMEFRAME OR INSTRUMENT\n\n\
+                         Provider {} does not supply {} candles for {}.\n\n\
+                         • Press 't' to cycle timeframe (1m, 5m, 15m, 1h, 1d)\n\
+                         • Run :CHART BTCUSDT for full Binance Spot coverage",
+                        app.asset.venue,
+                        app.timeframe,
+                        app.asset.key()
+                    )
+                }
+                ChartDataStatus::RateLimited => {
+                    format!(
+                        "RATE LIMIT REACHED (HTTP 429/418)\n\n\
+                         Provider {} rate limit exceeded. Automatic backoff in progress.\n\
+                         Cooling down requests to preserve API integrity.\n\n\
+                         Press 'R' to retry once cooldown expires.",
+                        app.asset.venue
+                    )
+                }
+                ChartDataStatus::Empty => {
+                    format!(
+                        "NO HISTORICAL DATA RETURNED\n\n\
+                         Provider returned 0 bars for {} on timeframe {}.\n\n\
+                         • Press 't' to cycle timeframe\n\
+                         • Press 'R' to re-request\n\
+                         • Run :MARKET to select an actively traded pair",
+                        app.asset.key(),
+                        app.timeframe
+                    )
+                }
+                ChartDataStatus::Error => {
+                    let err = app
+                        .market
+                        .chart_error
+                        .as_deref()
+                        .unwrap_or("Network request failed");
+                    format!(
+                        "UNABLE TO LOAD HISTORICAL CANDLES\n\n\
+                         Error: {err}\n\n\
+                         • Press 'R' to retry\n\
+                         • Press 't' to cycle timeframe\n\
+                         • Run :CHART BTCUSDT to verify network connectivity",
+                    )
+                }
+                ChartDataStatus::Stale | ChartDataStatus::NotRequested | ChartDataStatus::Ready => {
+                    format!(
+                        "No historical candles loaded for {}.\n\
+                         Waiting for provider response or local SQLite cache.\n\n\
+                         Controls:\n\
+                         • t: Timeframe (1m, 5m, 15m, 1h, 4h, 1d)\n\
+                         • i: Overlay (SMA, EMA, Bollinger, None)\n\
+                         • g: Sub-Indicator (Volume, RSI, MACD, ATR)\n\
+                         • +/-: Zoom in / Zoom out\n\
+                         • h/l: Pan historical bars\n\
+                         • R: Force refresh",
+                        app.asset.key()
+                    )
+                }
+            };
+            Paragraph::new(msg)
+                .style(
+                    Style::default().fg(if app.market.chart_status.is_actionable_error() {
+                        AMBER
+                    } else {
+                        SECONDARY
+                    }),
+                )
+                .render(inner, buf);
             return;
         }
 

@@ -12,7 +12,7 @@ use crossterm::{
 use futures_util::StreamExt;
 use omt_core::{
     AssetId, Candle, Company, DataStatus, InstrumentInfo, MacroObservation, NewsCategory, NewsItem,
-    Quote, Timeframe,
+    Quote, Timeframe, command::Workspace,
 };
 use omt_providers::{
     Http, market,
@@ -158,7 +158,11 @@ async fn researcher(
         }
     }
 }
-fn apply_research(c: &mut Controller, event: ResearchResult) -> Result<()> {
+fn apply_research(
+    c: &mut Controller,
+    event: ResearchResult,
+    request_tx: &mpsc::Sender<ResearchRequest>,
+) -> Result<()> {
     match event {
         ResearchResult::Company(result, ticker) => match result {
             Ok(company) => {
@@ -166,6 +170,13 @@ fn apply_research(c: &mut Controller, event: ResearchResult) -> Result<()> {
                 let mut current = std::mem::take(&mut c.app.news_items);
                 current.extend(filing_news);
                 c.app.news_items = research::dedup_news(current);
+                for item in &mut c.app.news_items {
+                    if item.body.is_none()
+                        && let Ok(Some((body, _))) = c.store.get::<String>("articles", &item.id)
+                    {
+                        item.body = Some(body);
+                    }
+                }
                 let _ = c.store.put("news", "recent", &c.app.news_items);
                 c.store.put("company", &ticker, &company)?;
                 c.app.companies = c.store.companies()?;
@@ -202,12 +213,20 @@ fn apply_research(c: &mut Controller, event: ResearchResult) -> Result<()> {
                 current.extend(incoming);
                 c.app.news_items = research::dedup_news(current);
                 c.app.news_updated_at = Some(chrono::Utc::now());
+                for item in &mut c.app.news_items {
+                    if item.body.is_none()
+                        && let Ok(Some((body, _))) = c.store.get::<String>("articles", &item.id)
+                    {
+                        item.body = Some(body);
+                    }
+                }
                 let _ = c.store.put("news", "recent", &c.app.news_items);
                 c.app.research_status = format!(
                     "News updated ({}) {} items",
                     category.label(),
                     c.app.news_items.len()
                 );
+                prefetch_news_articles(c, request_tx, 6);
             }
             Err(e) => {
                 c.app.research_status = format!("News fetch error: {e}");
@@ -215,9 +234,11 @@ fn apply_research(c: &mut Controller, event: ResearchResult) -> Result<()> {
         },
         ResearchResult::Article(id, result) => match result {
             Ok(body) => {
+                let _ = c.store.put("articles", &id, &body);
                 if let Some(item) = c.app.news_items.iter_mut().find(|n| n.id == id) {
                     item.body = Some(body);
                 }
+                let _ = c.store.put("news", "recent", &c.app.news_items);
             }
             Err(e) => {
                 c.app.message = format!("Article body fetch failed: {e}");
@@ -237,6 +258,39 @@ fn apply_research(c: &mut Controller, event: ResearchResult) -> Result<()> {
         },
     }
     Ok(())
+}
+
+fn prefetch_news_articles(
+    c: &mut Controller,
+    request_tx: &mpsc::Sender<ResearchRequest>,
+    limit: usize,
+) {
+    if c.offline {
+        return;
+    }
+    let items = omt_tui::views::filtered_news_items(&c.app);
+    if items.is_empty() {
+        return;
+    }
+    let sel_idx = c.app.cursor.min(items.len().saturating_sub(1));
+    let mut to_prefetch = Vec::new();
+    for offset in 0..limit {
+        let idx = sel_idx + offset;
+        if let Some(item) = items.get(idx) {
+            to_prefetch.push(item.clone());
+        }
+    }
+    for item in to_prefetch {
+        if item.body.is_none() && !item.url.is_empty() {
+            if let Ok(Some((cached_body, _))) = c.store.get::<String>("articles", &item.id) {
+                if let Some(real_item) = c.app.news_items.iter_mut().find(|n| n.id == item.id) {
+                    real_item.body = Some(cached_body);
+                }
+            } else {
+                let _ = request_tx.try_send(ResearchRequest::Article(item));
+            }
+        }
+    }
 }
 fn apply_market(app: &mut App, mut market: omt_data::MarketState) {
     let key = format!("{}:{}", app.asset.key(), app.timeframe);
@@ -354,6 +408,13 @@ async fn main() -> Result<()> {
         app.news_items.extend(f_news);
     }
     app.news_items = research::dedup_news(app.news_items);
+    for item in &mut app.news_items {
+        if item.body.is_none()
+            && let Ok(Some((body, _))) = store.get::<String>("articles", &item.id)
+        {
+            item.body = Some(body);
+        }
+    }
     if let Some(asset) = store.setting("asset")? {
         app.asset = asset.parse().map_err(anyhow::Error::msg)?;
     }
@@ -392,6 +453,13 @@ async fn main() -> Result<()> {
     .into();
     let key = format!("{}:{}", app.asset.key(), app.timeframe);
     if let Some((bars, at)) = store.get::<Vec<Candle>>("candles", &key)? {
+        let is_stale = chrono::Utc::now().signed_duration_since(at).num_seconds()
+            > app.timeframe.seconds() * 2;
+        app.market.chart_status = if is_stale {
+            omt_core::ChartDataStatus::Stale
+        } else {
+            omt_core::ChartDataStatus::Ready
+        };
         app.market.candles = bars;
         app.market.candles_received_at = Some(at);
         app.message = format!("Cached candles fetched {at}");
@@ -413,8 +481,8 @@ async fn main() -> Result<()> {
     };
     let (subscription_tx, subscription_rx) = watch::channel(subscription(&c.app));
     let (market_tx, mut market_rx) = watch::channel(c.app.market.clone());
-    let (request_tx, request_rx) = mpsc::channel(8);
-    let (result_tx, mut result_rx) = mpsc::channel(16);
+    let (request_tx, request_rx) = mpsc::channel(64);
+    let (result_tx, mut result_rx) = mpsc::channel(64);
     let mut background = tokio::task::JoinSet::new();
     if !args.offline {
         background.spawn(market::service(http.clone(), subscription_rx, market_tx));
@@ -452,7 +520,7 @@ async fn main() -> Result<()> {
         let stop = tokio::time::sleep(Duration::from_secs(args.wait_seconds.min(120)));
         tokio::pin!(stop);
         loop {
-            tokio::select! {_=&mut stop=>break,changed=market_rx.changed(),if !args.offline=>{if changed.is_ok(){apply_market(&mut c.app,market_rx.borrow_and_update().clone());}},Some(result)=result_rx.recv()=>{apply_research(&mut c,result)?;}}
+            tokio::select! {_=&mut stop=>break,changed=market_rx.changed(),if !args.offline=>{if changed.is_ok(){apply_market(&mut c.app,market_rx.borrow_and_update().clone());}},Some(result)=result_rx.recv()=>{apply_research(&mut c,result,&request_tx)?;}}
         }
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40))?;
         terminal.draw(|f| omt_tui::render(f, &c.app))?;
@@ -487,14 +555,32 @@ async fn main() -> Result<()> {
     let mut first = true;
     while !c.app.quit {
         tokio::select! {
-                _=frame_tick.tick()=>{if dirty{let before=Instant::now();terminal.draw(|f|omt_tui::render(f,&c.app))?;let draw_us=before.elapsed().as_micros() as u64;c.app.record_draw_micros(draw_us);if first{tracing::info!(startup_ms=started.elapsed().as_millis(),"first terminal draw");first=false;}tracing::debug!(draw_us,"draw");dirty=false;}},
-                _=seconds.tick()=>dirty=true,
-                _=persistence.tick()=>{if let Err(e)=save(&c){c.app.message=format!("Persistence: {e}");}},
-                changed=market_rx.changed(),if !args.offline=>{if changed.is_ok(){apply_market(&mut c.app,market_rx.borrow_and_update().clone());dirty=true;}},
-                Some(result)=result_rx.recv()=>{if let Err(e)=apply_research(&mut c,result){c.app.message=e.to_string();}dirty=true;},
-                event=events.next()=>{match event{Some(Ok(Event::Key(key))) if key.kind==KeyEventKind::Press=>{if let Some(text)=c.app.key(key){match c.command(&text){Ok(request)=>{let new=subscription(&c.app);if *subscription_tx.borrow()!=new{subscription_tx.send_replace(new);}
-        if let Some(request)=request&& !args.offline&&request_tx.try_send(request).is_err(){c.app.research_status="Research queue full; retry shortly".into();}},Err(e)=>c.app.message=e.to_string()}}dirty=true;},Some(Ok(Event::Resize(..)))=>dirty=true,Some(Ok(Event::Mouse(m)))=>{match m.kind{MouseEventKind::ScrollDown=>c.app.cursor=c.app.cursor.saturating_add(1),MouseEventKind::ScrollUp=>c.app.cursor=c.app.cursor.saturating_sub(1),_=>{}}dirty=true;},Some(Err(e))=>return Err(e.into()),None=>break,_=>{}}}
+        _=frame_tick.tick()=>{if dirty{let before=Instant::now();terminal.draw(|f|omt_tui::render(f,&c.app))?;let draw_us=before.elapsed().as_micros() as u64;c.app.record_draw_micros(draw_us);if first{tracing::info!(startup_ms=started.elapsed().as_millis(),"first terminal draw");first=false;}tracing::debug!(draw_us,"draw");dirty=false;}},
+        _=seconds.tick()=>dirty=true,
+        _=persistence.tick()=>{if let Err(e)=save(&c){c.app.message=format!("Persistence: {e}");}},
+        changed=market_rx.changed(),if !args.offline=>{if changed.is_ok(){apply_market(&mut c.app,market_rx.borrow_and_update().clone());dirty=true;}},
+        Some(result)=result_rx.recv()=>{if let Err(e)=apply_research(&mut c,result,&request_tx){c.app.message=e.to_string();}dirty=true;},
+        event=events.next()=>{match event{Some(Ok(Event::Key(key))) if key.kind==KeyEventKind::Press=>{
+            if let Some(text)=c.app.key(key){
+                match c.command(&text){
+                    Ok(request)=>{
+                        let new=subscription(&c.app);
+                        if *subscription_tx.borrow()!=new{
+                            subscription_tx.send_replace(new);
+                        }
+                        if let Some(request)=request&& !args.offline&&request_tx.try_send(request).is_err(){
+                            c.app.research_status="Research queue full; retry shortly".into();
+                        }
+                    },
+                    Err(e)=>c.app.message=e.to_string()
                 }
+            }
+            if c.app.workspace == Workspace::News {
+                prefetch_news_articles(&mut c, &request_tx, 3);
+            }
+            dirty=true;
+        },Some(Ok(Event::Resize(..)))=>dirty=true,Some(Ok(Event::Mouse(m)))=>{match m.kind{MouseEventKind::ScrollDown=>{c.app.cursor=c.app.cursor.saturating_add(1);if c.app.workspace==Workspace::News{prefetch_news_articles(&mut c,&request_tx,3);}},MouseEventKind::ScrollUp=>{c.app.cursor=c.app.cursor.saturating_sub(1);if c.app.workspace==Workspace::News{prefetch_news_articles(&mut c,&request_tx,3);}},_=>{}}dirty=true;},Some(Err(e))=>return Err(e.into()),None=>break,_=>{}}}
+        }
     }
     save(&c)?;
     background.abort_all();

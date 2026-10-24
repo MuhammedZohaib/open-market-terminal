@@ -3,7 +3,8 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use omt_core::{
-    AssetClass, AssetId, Candle, DataStatus, InstrumentInfo, Quote, Timeframe, TradingStatus, Venue,
+    AssetClass, AssetId, Candle, ChartDataStatus, DataStatus, InstrumentInfo, Quote, Timeframe,
+    TradingStatus, Venue,
 };
 use omt_data::{MarketState, Subscription};
 use rust_decimal::Decimal;
@@ -462,6 +463,7 @@ enum FeedEvent {
     BookTicker(String, Decimal, Decimal, DateTime<Utc>),
     Candle(Candle),
     History(String, Vec<Candle>),
+    ChartStatus(String, ChartDataStatus, Option<String>),
     Status(String, String),
     Reconnect,
     Coalesced(u64),
@@ -602,8 +604,21 @@ pub async fn service(
                     Some(FeedEvent::Candle(b)) => state.candle(b),
                     Some(FeedEvent::History(key, bars)) => {
                         if state.chart_key == key {
+                            let empty = bars.is_empty();
                             state.merge_candles(bars);
+                            state.chart_status = if empty {
+                                ChartDataStatus::Empty
+                            } else {
+                                ChartDataStatus::Ready
+                            };
+                            state.chart_error = None;
                             state.venue_status.remove("History");
+                        }
+                    }
+                    Some(FeedEvent::ChartStatus(key, status, err)) => {
+                        if state.chart_key == key {
+                            state.chart_status = status;
+                            state.chart_error = err;
                         }
                     }
                     Some(FeedEvent::Status(provider, status)) => {
@@ -661,7 +676,21 @@ fn spawn_detail_tasks(
         state.candles_received_at = None;
         state.chart_key = key.clone();
     }
-    if !(sub.chart.venue == Venue::Iex && alpaca_credentials().is_err()) {
+    if sub.chart.venue == Venue::Iex && alpaca_credentials().is_err() {
+        state.chart_status = ChartDataStatus::AuthenticationRequired;
+        state.chart_error = Some(
+            "Set APCA_API_KEY_ID and APCA_API_SECRET_KEY in :SETTINGS or env for IEX equities"
+                .into(),
+        );
+        state.venue_status.insert(
+            "IEX".into(),
+            "Optional (configure APCA_API_KEY_ID in Settings for live IEX)".into(),
+        );
+    } else {
+        if state.candles.is_empty() {
+            state.chart_status = ChartDataStatus::Loading;
+            state.chart_error = None;
+        }
         let history_tx = tx.clone();
         let h = http.clone();
         let chart = sub.chart.clone();
@@ -671,24 +700,53 @@ fn spawn_detail_tasks(
             loop {
                 match history(&h, &chart, tf).await {
                     Ok(b) => {
+                        let is_empty = b.is_empty();
                         let _ = history_tx
                             .send(FeedEvent::History(chart_key.clone(), b))
                             .await;
+                        let status = if is_empty {
+                            ChartDataStatus::Empty
+                        } else {
+                            ChartDataStatus::Ready
+                        };
+                        let _ = history_tx
+                            .send(FeedEvent::ChartStatus(chart_key.clone(), status, None))
+                            .await;
                     }
                     Err(e) => {
+                        let err_msg = e.to_string();
+                        let status = if err_msg.contains("APCA_API_KEY_ID")
+                            || err_msg.contains("401")
+                            || err_msg.contains("403")
+                        {
+                            ChartDataStatus::AuthenticationRequired
+                        } else if err_msg.contains("429")
+                            || err_msg.contains("418")
+                            || err_msg.contains("rate limit")
+                        {
+                            ChartDataStatus::RateLimited
+                        } else if err_msg.contains("does not support")
+                            || err_msg.contains("unsupported")
+                        {
+                            ChartDataStatus::Unsupported
+                        } else {
+                            ChartDataStatus::Error
+                        };
                         let _ = history_tx
-                            .send(FeedEvent::Status("History".into(), e.to_string()))
+                            .send(FeedEvent::ChartStatus(
+                                chart_key.clone(),
+                                status,
+                                Some(err_msg.clone()),
+                            ))
+                            .await;
+                        let _ = history_tx
+                            .send(FeedEvent::Status("History".into(), err_msg))
                             .await;
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
-    } else {
-        state.venue_status.insert(
-            "IEX".into(),
-            "Optional (configure APCA_API_KEY_ID in Settings for live IEX)".into(),
-        );
     }
 
     for venue in [Venue::Binance, Venue::Coinbase, Venue::Iex] {

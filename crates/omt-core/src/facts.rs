@@ -448,6 +448,89 @@ pub fn summarize(facts: &[FinancialFact], view: PeriodView) -> Option<Fundamenta
         debt_to_equity_pct,
     })
 }
+
+#[derive(Debug, Clone)]
+pub struct MetricHistoryPoint {
+    pub period_end: NaiveDate,
+    pub period_label: String,
+    pub value: Decimal,
+    pub concept: String,
+    pub form: String,
+    pub accession: String,
+    pub unit: String,
+    pub filed: NaiveDate,
+    pub start: Option<NaiveDate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetricAuditDetails {
+    pub metric_name: String,
+    pub points: Vec<MetricHistoryPoint>,
+    pub min_value: Option<Decimal>,
+    pub max_value: Option<Decimal>,
+    pub latest_yoy_pct: Option<Decimal>,
+    pub unit: String,
+}
+
+pub fn metric_audit(
+    facts: &[FinancialFact],
+    view: PeriodView,
+    metric_name: &str,
+) -> Option<MetricAuditDetails> {
+    let selected = select(facts, view);
+    let mut matching: Vec<&FinancialFact> = selected
+        .iter()
+        .copied()
+        .filter(|f| f.metric == metric_name)
+        .collect();
+    if matching.is_empty() {
+        return None;
+    }
+    matching.sort_by_key(|f| f.end);
+    let unit = matching
+        .first()
+        .map(|f| f.unit.clone())
+        .unwrap_or_else(|| "USD".into());
+    let mut points = Vec::new();
+    let mut min_val: Option<Decimal> = None;
+    let mut max_val: Option<Decimal> = None;
+
+    for f in &matching {
+        let label = match view {
+            PeriodView::Annual => f.end.format("%Y").to_string(),
+            PeriodView::Quarterly => f.end.format("%Y-Q%q").to_string(),
+        };
+        min_val = Some(min_val.map(|m| m.min(f.value)).unwrap_or(f.value));
+        max_val = Some(max_val.map(|m| m.max(f.value)).unwrap_or(f.value));
+        points.push(MetricHistoryPoint {
+            period_end: f.end,
+            period_label: label,
+            value: f.value,
+            concept: f.concept.clone(),
+            form: f.form.clone(),
+            accession: f.accession.clone(),
+            unit: f.unit.clone(),
+            filed: f.filed,
+            start: f.start,
+        });
+    }
+
+    let latest_yoy_pct = if matching.len() >= 2 {
+        let target = matching[matching.len() - 1];
+        yoy_growth(&matching, target)
+    } else {
+        None
+    };
+
+    Some(MetricAuditDetails {
+        metric_name: metric_name.to_string(),
+        points,
+        min_value: min_val,
+        max_value: max_val,
+        latest_yoy_pct,
+        unit,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,5 +694,47 @@ mod tests {
             .find(|r| r.metric == "Gross margin %")
             .unwrap();
         assert!(gm.values[0].is_some());
+    }
+
+    #[test]
+    fn test_metric_audit_extracts_full_history_and_provenance() {
+        let facts = vec![
+            FinancialFact {
+                metric: "Revenue".into(),
+                concept: "Revenues".into(),
+                value: Decimal::from(383_000_000_000i64),
+                unit: "USD".into(),
+                start: Some(NaiveDate::from_ymd_opt(2022, 10, 1).unwrap()),
+                end: NaiveDate::from_ymd_opt(2023, 9, 30).unwrap(),
+                filed: NaiveDate::from_ymd_opt(2023, 11, 3).unwrap(),
+                accession: "0000320193-23-000106".into(),
+                form: "10-K".into(),
+                source: "SEC".into(),
+            },
+            FinancialFact {
+                metric: "Revenue".into(),
+                concept: "Revenues".into(),
+                value: Decimal::from(391_000_000_000i64),
+                unit: "USD".into(),
+                start: Some(NaiveDate::from_ymd_opt(2023, 10, 1).unwrap()),
+                end: NaiveDate::from_ymd_opt(2024, 9, 28).unwrap(),
+                filed: NaiveDate::from_ymd_opt(2024, 11, 1).unwrap(),
+                accession: "0000320193-24-000106".into(),
+                form: "10-K".into(),
+                source: "SEC".into(),
+            },
+        ];
+
+        let audit = metric_audit(&facts, PeriodView::Annual, "Revenue").unwrap();
+        assert_eq!(audit.metric_name, "Revenue");
+        assert_eq!(audit.points.len(), 2);
+        assert_eq!(audit.points[0].period_label, "2023");
+        assert_eq!(audit.points[0].value, Decimal::from(383_000_000_000i64));
+        assert_eq!(audit.points[0].concept, "Revenues");
+        assert_eq!(audit.points[1].period_label, "2024");
+        assert_eq!(audit.points[1].value, Decimal::from(391_000_000_000i64));
+        assert_eq!(audit.min_value, Some(Decimal::from(383_000_000_000i64)));
+        assert_eq!(audit.max_value, Some(Decimal::from(391_000_000_000i64)));
+        assert!(audit.latest_yoy_pct.is_some());
     }
 }

@@ -130,9 +130,28 @@ impl Controller {
                     self.app.market.candles.clear();
                     self.app.market.candles_received_at = None;
                     if let Some((bars, at)) = self.store.get::<Vec<Candle>>("candles", &key)? {
+                        let is_stale = chrono::Utc::now().signed_duration_since(at).num_seconds()
+                            > self.app.timeframe.seconds() * 2;
+                        self.app.market.chart_status = if is_stale {
+                            omt_core::ChartDataStatus::Stale
+                        } else {
+                            omt_core::ChartDataStatus::Ready
+                        };
+                        self.app.market.chart_error = None;
                         self.app.market.candles = bars;
                         self.app.market.candles_received_at = Some(at);
                         self.app.message = format!("Historical cache fetched {at}");
+                    } else if self.app.asset.venue == Venue::Iex
+                        && std::env::var("APCA_API_KEY_ID").is_err()
+                    {
+                        self.app.market.chart_status =
+                            omt_core::ChartDataStatus::AuthenticationRequired;
+                        self.app.market.chart_error = Some(
+                            "Set APCA_API_KEY_ID and APCA_API_SECRET_KEY for IEX equities".into(),
+                        );
+                    } else {
+                        self.app.market.chart_status = omt_core::ChartDataStatus::Loading;
+                        self.app.market.chart_error = None;
                     }
                     self.app.market.chart_key = key;
                 }
@@ -683,7 +702,17 @@ impl Controller {
                             self.app.news_reader_expanded = !self.app.news_reader_expanded;
                             if let Some(item) = views::selected_news_item(&self.app) {
                                 if item.body.is_none() && !item.url.is_empty() {
-                                    research = Some(ResearchRequest::Article(item.clone()));
+                                    if let Ok(Some((cached_body, _))) =
+                                        self.store.get::<String>("articles", &item.id)
+                                    {
+                                        if let Some(real_item) =
+                                            self.app.news_items.iter_mut().find(|n| n.id == item.id)
+                                        {
+                                            real_item.body = Some(cached_body);
+                                        }
+                                    } else {
+                                        research = Some(ResearchRequest::Article(item.clone()));
+                                    }
                                 }
                                 self.app.message = format!(
                                     "News Reader {}: {}",
@@ -717,7 +746,13 @@ impl Controller {
                         }
                         Workspace::Chart => {
                             self.app.market.chart_key.clear();
-                            self.app.message = "Refreshing chart candles...".into();
+                            self.app.market.chart_status = omt_core::ChartDataStatus::Loading;
+                            self.app.market.chart_error = None;
+                            self.app.message = format!(
+                                "Refreshing chart candles for {} ({})...",
+                                self.app.asset.key(),
+                                self.app.timeframe
+                            );
                         }
                         Workspace::Fin => {
                             research = self.company(&self.app.asset.symbol.clone())?;

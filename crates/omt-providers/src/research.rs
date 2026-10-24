@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use omt_core::{
     Company, Filing, FinancialFact, MacroObservation, NewsCategory, NewsItem, clean_html_to_text,
-    summarize_sec_filing_document,
+    extract_article_content, summarize_sec_filing_document,
 };
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
@@ -863,9 +863,41 @@ pub async fn fetch_article_or_filing_body(
             .header("User-Agent", ua)
             .header("Accept-Encoding", "identity")
     } else {
-        http.client.get(url)
+        http.client
+            .get(url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            )
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            )
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Accept-Encoding", "identity")
+            .header(
+                "Sec-Ch-Ua",
+                "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"",
+            )
+            .header("Sec-Ch-Ua-Mobile", "?0")
+            .header("Sec-Ch-Ua-Platform", "\"Windows\"")
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "none")
+            .header("Sec-Fetch-User", "?1")
+            .header("Upgrade-Insecure-Requests", "1")
     };
-    let raw = http.request_text(req).await?;
+    let raw = match http.request_text(req).await {
+        Ok(text) => text,
+        Err(e) => {
+            if !description.trim().is_empty() {
+                return Ok(format!(
+                    "{description}\n\n[Publisher connection: {e}. Press 'o' to open original article in browser.]\n\nCanonical Source: {url}"
+                ));
+            }
+            return Err(e);
+        }
+    };
     if is_sec_filing || url.contains("sec.gov/Archives/edgar/") {
         return Ok(summarize_sec_filing_document(
             form.unwrap_or("SEC"),
@@ -873,30 +905,18 @@ pub async fn fetch_article_or_filing_body(
             &raw,
         ));
     }
-    let lower = raw.to_ascii_lowercase();
-    let slice = if let Some(a_start) = lower.find("<article") {
-        if let Some(a_end) = lower[a_start..].find("</article>") {
-            &raw[a_start..a_start + a_end + 10]
-        } else {
-            &raw[a_start..]
-        }
-    } else if let Some(m_start) = lower.find("<main") {
-        if let Some(m_end) = lower[m_start..].find("</main>") {
-            &raw[m_start..m_start + m_end + 7]
-        } else {
-            &raw[m_start..]
-        }
-    } else {
-        raw.as_str()
-    };
-    let cleaned = clean_html_to_text(slice);
-    let excerpt: String = cleaned.chars().take(5000).collect();
-    if excerpt.trim().len() < 40 {
-        bail!(
-            "Publisher restricts full-text programmatic extraction; showing feed summary. Press 'o' to open in browser."
-        );
+    let extracted = extract_article_content(&raw, url);
+    if extracted.is_excerpt
+        && extracted
+            .body
+            .starts_with("Full-text programmatic extraction restricted")
+        && !description.trim().is_empty()
+    {
+        return Ok(format!(
+            "{description}\n\n[Publisher restricts full programmatic extraction. Press 'o' to open in browser.]\n\nCanonical Source: {url}"
+        ));
     }
-    Ok(excerpt)
+    Ok(extracted.body)
 }
 #[cfg(test)]
 mod tests {

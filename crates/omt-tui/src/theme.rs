@@ -16,6 +16,11 @@ pub const POSITIVE: Color = Color::Rgb(74, 198, 154); // #4AC69A
 pub const NEGATIVE: Color = Color::Rgb(235, 107, 120); // #EB6B78
 pub const SELECTION: Color = Color::Rgb(37, 54, 73); // #253649
 pub const INFO_BLUE: Color = Color::Rgb(110, 168, 229);
+pub const CYAN: Color = Color::Rgb(86, 204, 242); // #56CCF2 Electric Cyan for controls
+pub const CYAN_BG: Color = Color::Rgb(14, 38, 52); // #0E2634 Subtle cyan elevated container
+pub const VIOLET: Color = Color::Rgb(178, 148, 235); // #B294EB
+pub const ACTIVE_FOCUS: Color = AMBER;
+pub const INACTIVE_BORDER: Color = Color::Rgb(44, 52, 64); // #2C3440 Soft muted border
 
 pub fn direction_color(value: Option<Decimal>) -> Color {
     match value {
@@ -58,4 +63,16 @@ pub fn pill_style(active: bool) -> Style {
     } else {
         Style::default().fg(SECONDARY).bg(ELEVATED_BG)
     }
+}
+
+pub fn keycap_style() -> Style {
+    Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+}
+
+pub fn keycap_label_style() -> Style {
+    Style::default().fg(SECONDARY)
+}
+
+pub fn control_pill_style() -> Style {
+    Style::default().fg(CYAN).bg(CYAN_BG).bold()
 }

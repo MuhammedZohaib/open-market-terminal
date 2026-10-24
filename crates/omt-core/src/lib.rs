@@ -182,6 +182,66 @@ pub enum DataStatus {
     Disconnected,
     Historical,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ChartDataStatus {
+    #[default]
+    NotRequested,
+    Loading,
+    Ready,
+    Stale,
+    Empty,
+    Unsupported,
+    AuthenticationRequired,
+    RateLimited,
+    Error,
+}
+impl ChartDataStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotRequested => "NOT REQUESTED",
+            Self::Loading => "LOADING",
+            Self::Ready => "READY",
+            Self::Stale => "STALE CACHE",
+            Self::Empty => "EMPTY",
+            Self::Unsupported => "UNSUPPORTED",
+            Self::AuthenticationRequired => "AUTH REQUIRED",
+            Self::RateLimited => "RATE LIMITED",
+            Self::Error => "ERROR",
+        }
+    }
+    pub fn is_actionable_error(self) -> bool {
+        matches!(
+            self,
+            Self::Unsupported | Self::AuthenticationRequired | Self::RateLimited | Self::Error
+        )
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ProviderStatus {
+    #[default]
+    Live,
+    Delayed,
+    Cached,
+    Stale,
+    Loading,
+    Unavailable,
+    AuthRequired,
+    Error,
+}
+impl ProviderStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Live => "LIVE",
+            Self::Delayed => "DELAYED",
+            Self::Cached => "CACHED",
+            Self::Stale => "STALE",
+            Self::Loading => "LOADING",
+            Self::Unavailable => "UNAVAILABLE",
+            Self::AuthRequired => "AUTH REQ",
+            Self::Error => "ERROR",
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quote {
     pub asset: AssetId,
@@ -918,9 +978,359 @@ pub fn decode_html_entities(input: &str) -> String {
     out.push_str(rest);
     out
 }
+pub fn sanitize_terminal_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if let Some(&next) = chars.peek() {
+                if next == '[' {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() || c == '~' {
+                            break;
+                        }
+                    }
+                    continue;
+                } else if next == ']' {
+                    chars.next();
+                    let mut prev = ' ';
+                    for c in chars.by_ref() {
+                        if c == '\x07' || (prev == '\x1b' && c == '\\') {
+                            break;
+                        }
+                        prev = c;
+                    }
+                    continue;
+                }
+            }
+            continue;
+        }
+        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedArticle {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub published_time: Option<String>,
+    pub canonical_url: Option<String>,
+    pub body: String,
+    pub is_excerpt: bool,
+}
+
+pub fn extract_article_content(raw_html: &str, url: &str) -> ExtractedArticle {
+    let lower = raw_html.to_ascii_lowercase();
+
+    let extract_meta = |key_attr: &str, key_val: &str| -> Option<String> {
+        let pat1 = format!("{key_attr}=\"{key_val}\"");
+        let pat2 = format!("{key_attr}='{key_val}'");
+        let pos = lower.find(&pat1).or_else(|| lower.find(&pat2))?;
+        let tag_start = raw_html[..pos].rfind('<')?;
+        let tag_end_rel = raw_html[pos..].find('>')?;
+        let meta_tag = &raw_html[tag_start..pos + tag_end_rel];
+        let meta_lower = meta_tag.to_ascii_lowercase();
+        for content_pat in ["content=\"", "content='"] {
+            if let Some(c_pos) = meta_lower.find(content_pat) {
+                let start = c_pos + content_pat.len();
+                let quote = content_pat.chars().last().unwrap();
+                if let Some(c_end) = meta_tag[start..].find(quote) {
+                    let val = decode_html_entities(meta_tag[start..start + c_end].trim());
+                    if !val.is_empty() {
+                        return Some(val);
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    let extract_link_rel = |rel_val: &str| -> Option<String> {
+        let pat1 = format!("rel=\"{rel_val}\"");
+        let pat2 = format!("rel='{rel_val}'");
+        let pos = lower.find(&pat1).or_else(|| lower.find(&pat2))?;
+        let tag_start = raw_html[..pos].rfind('<')?;
+        let tag_end_rel = raw_html[pos..].find('>')?;
+        let tag = &raw_html[tag_start..pos + tag_end_rel];
+        let tag_lower = tag.to_ascii_lowercase();
+        for href_pat in ["href=\"", "href='"] {
+            if let Some(h_pos) = tag_lower.find(href_pat) {
+                let start = h_pos + href_pat.len();
+                let quote = href_pat.chars().last().unwrap();
+                if let Some(h_end) = tag[start..].find(quote) {
+                    let val = decode_html_entities(tag[start..start + h_end].trim());
+                    if !val.is_empty() {
+                        return Some(val);
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    let extract_time_datetime = || -> Option<String> {
+        if let Some(pos) = lower.find("datetime=\"") {
+            let start = pos + 10;
+            if let Some(end) = raw_html[start..].find('"') {
+                return Some(decode_html_entities(raw_html[start..start + end].trim()));
+            }
+        }
+        None
+    };
+
+    let title = extract_meta("property", "og:title")
+        .or_else(|| extract_meta("name", "twitter:title"))
+        .or_else(|| extract_meta("name", "title"))
+        .or_else(|| {
+            if let Some(t_start) = lower.find("<title>")
+                && let Some(t_end) = lower[t_start..].find("</title>")
+            {
+                let t = decode_html_entities(&raw_html[t_start + 7..t_start + t_end]);
+                return Some(t.split('|').next().unwrap_or(&t).trim().to_string());
+            }
+            None
+        });
+
+    let author = extract_meta("name", "author")
+        .or_else(|| extract_meta("property", "article:author"))
+        .or_else(|| extract_meta("name", "byl"));
+
+    let published_time = extract_meta("property", "article:published_time")
+        .or_else(|| extract_meta("name", "pubdate"))
+        .or_else(extract_time_datetime);
+
+    let canonical_url =
+        extract_link_rel("canonical").or_else(|| extract_meta("property", "og:url"));
+
+    let slice = if let Some(a_start) = lower.find("<article") {
+        if let Some(a_end) = lower[a_start..].find("</article>") {
+            &raw_html[a_start..a_start + a_end + 10]
+        } else {
+            &raw_html[a_start..]
+        }
+    } else if let Some(m_start) = lower.find("<main") {
+        if let Some(m_end) = lower[m_start..].find("</main>") {
+            &raw_html[m_start..m_start + m_end + 7]
+        } else {
+            &raw_html[m_start..]
+        }
+    } else if let Some(d_start) = lower
+        .find("class=\"article-body")
+        .or_else(|| lower.find("class=\"story-content"))
+        .or_else(|| lower.find("class=\"post-content"))
+        .or_else(|| lower.find("id=\"article-body"))
+    {
+        let tag_start = raw_html[..d_start].rfind('<').unwrap_or(d_start);
+        &raw_html[tag_start..]
+    } else {
+        raw_html
+    };
+
+    let cleaned = clean_html_to_text(slice);
+
+    let is_boilerplate = |line: &str| -> bool {
+        let l = line.to_ascii_lowercase();
+        let words: Vec<&str> = l.split_whitespace().collect();
+        let count = words.len();
+        // Eliminate single-word navigation remnants (e.g. "Home", "Markets", "News", "Share", "Like", "Follow")
+        if count <= 1 {
+            return true;
+        }
+        // Eliminate short navigation phrases (<= 3 words without sentence punctuation)
+        if count <= 3
+            && !l.ends_with('.')
+            && !l.ends_with('?')
+            && !l.ends_with('!')
+            && !l.ends_with('"')
+            && !l.ends_with('\'')
+            && matches!(
+                words[0],
+                "home"
+                    | "menu"
+                    | "search"
+                    | "markets"
+                    | "market"
+                    | "news"
+                    | "crypto"
+                    | "business"
+                    | "tech"
+                    | "investing"
+                    | "politics"
+                    | "opinion"
+                    | "video"
+                    | "audio"
+                    | "podcast"
+                    | "share"
+                    | "like"
+                    | "tweet"
+                    | "follow"
+                    | "read"
+                    | "related"
+                    | "trending"
+                    | "popular"
+                    | "top"
+                    | "latest"
+                    | "breaking"
+                    | "sign"
+                    | "log"
+                    | "subscribe"
+                    | "click"
+                    | "learn"
+                    | "watch"
+                    | "listen"
+                    | "view"
+                    | "see"
+                    | "photo"
+                    | "image"
+                    | "source"
+                    | "credit"
+                    | "advertisement"
+                    | "sponsored"
+                    | "ad"
+                    | "comments"
+                    | "comment"
+                    | "tags"
+                    | "category"
+                    | "categories"
+                    | "topics"
+                    | "topic"
+                    | "more"
+                    | "next"
+                    | "previous"
+                    | "back"
+                    | "skip"
+                    | "close"
+            )
+        {
+            return true;
+        }
+        // Breadcrumbs, navigation paths, and sharing bars
+        if count <= 10
+            && (l.contains(" > ")
+                || l.contains(" | ")
+                || l.contains(" • ")
+                || l.contains(" · ")
+                || l.contains(" » ")
+                || l.contains(" // "))
+        {
+            return true;
+        }
+        l.starts_with("sign up for")
+            || l.starts_with("sign in")
+            || l.starts_with("newsletter")
+            || l.starts_with("follow us on")
+            || l.starts_with("follow us")
+            || l.starts_with("subscribe to")
+            || l.starts_with("subscribe now")
+            || l.starts_with("all rights reserved")
+            || l.starts_with("terms of use")
+            || l.starts_with("terms of service")
+            || l.starts_with("privacy policy")
+            || l.starts_with("cookie preferences")
+            || l.starts_with("cookie policy")
+            || l.starts_with("we use cookies")
+            || l.starts_with("share this article")
+            || l.starts_with("share this")
+            || l.starts_with("share on")
+            || l.starts_with("read more:")
+            || l.starts_with("read next:")
+            || l.starts_with("click here to")
+            || l.starts_with("click here")
+            || l.starts_with("loading...")
+            || l.starts_with("advertisement")
+            || l.starts_with("ad:")
+            || l.starts_with("sponsored")
+            || l.starts_with("promoted:")
+            || l.starts_with("photo by")
+            || l.starts_with("photo credit")
+            || l.starts_with("image credit")
+            || l.starts_with("getty images")
+            || l.contains("unauthorized reproduction is strictly prohibited")
+            || l.contains("this story has been shared")
+    };
+
+    let mut filtered_paragraphs: Vec<String> = Vec::new();
+    let mut prev_line = String::new();
+
+    for p in cleaned.split("\n\n") {
+        let trimmed = p.trim();
+        if trimmed.len() < 2 || is_boilerplate(trimmed) {
+            continue;
+        }
+        if trimmed == prev_line {
+            continue;
+        }
+        if let Some(ref t) = title
+            && trimmed.eq_ignore_ascii_case(t.trim())
+            && !filtered_paragraphs.is_empty()
+        {
+            continue;
+        }
+        prev_line = trimmed.to_string();
+        filtered_paragraphs.push(trimmed.to_string());
+    }
+
+    let joined = filtered_paragraphs.join("\n\n");
+    let sanitized = sanitize_terminal_text(&joined);
+    let bounded: String = sanitized.chars().take(16384).collect();
+
+    if bounded.trim().len() < 40 {
+        ExtractedArticle {
+            title,
+            author,
+            published_time,
+            canonical_url,
+            body: format!(
+                "Full-text programmatic extraction restricted by publisher. Press 'o' to open the original article in your browser.\n\nCanonical Source: {url}"
+            ),
+            is_excerpt: true,
+        }
+    } else {
+        ExtractedArticle {
+            title,
+            author,
+            published_time,
+            canonical_url,
+            body: bounded,
+            is_excerpt: false,
+        }
+    }
+}
+
 pub fn clean_html_to_text(raw: &str) -> String {
     let mut cleaned = raw.to_string();
-    for tag in ["script", "style", "head", "svg", "noscript", "ix:header"] {
+    for tag in [
+        "script",
+        "style",
+        "head",
+        "svg",
+        "noscript",
+        "ix:header",
+        "nav",
+        "header",
+        "footer",
+        "aside",
+        "form",
+        "button",
+        "iframe",
+        "dialog",
+        "select",
+        "option",
+        "menu",
+        "figure",
+        "figcaption",
+        "picture",
+        "canvas",
+        "video",
+        "audio",
+        "object",
+        "embed",
+    ] {
         let open_pat = format!("<{tag}");
         let close_pat = format!("</{tag}>");
         loop {
@@ -1201,5 +1611,126 @@ mod tests {
         assert_eq!(yc.spread_2s10s_bps, Some(Decimal::from(50)));
         assert_eq!(yc.spread_3m10s_bps, Some(Decimal::from(30)));
         assert_eq!(yc.regime, "Normal (Upward Sloping)");
+    }
+
+    #[test]
+    fn test_article_extraction_cleans_boilerplate_and_scripts() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Apple Reports Record Q4 Revenue | TechNews</title>
+                <meta property="og:title" content="Apple Reports Record Q4 Revenue" />
+                <meta name="author" content="Jane Doe" />
+                <meta property="article:published_time" content="2026-10-23T16:30:00Z" />
+                <link rel="canonical" href="https://example.com/apple-q4-results" />
+                <style>body { font-family: sans-serif; }</style>
+                <script>console.log("tracking pixel");</script>
+            </head>
+            <body>
+                <header>
+                    <nav class="nav-menu">
+                        <a href="/home">Home</a>
+                        <a href="/markets">Markets</a>
+                        <button>Sign In</button>
+                    </nav>
+                </header>
+                <article>
+                    <h1 class="headline">Apple Reports Record Q4 Revenue</h1>
+                    <div class="share-buttons">Share on Twitter | Share on Facebook | Copy Link</div>
+                    <p class="body-p">Apple Inc. reported fourth-quarter revenue of $94.9 billion, up 6 percent year-over-year.</p>
+                    <div class="ad-banner">Advertisement: Buy Crypto Now!</div>
+                    <p class="body-p">Services revenue reached an all-time record of $25.0 billion during the fiscal quarter.</p>
+                    <p class="newsletter-cta">Sign up for our daily morning newsletter to get breaking news.</p>
+                    <p class="body-p">The company returned over $29 billion to shareholders during the quarter through dividends and repurchases.</p>
+                    <aside class="sidebar">
+                        <h3>Trending Stories</h3>
+                        <ul><li>Fed raises rates</li><li>Bitcoin hits new high</li></ul>
+                    </aside>
+                    <footer>
+                        <p>All rights reserved. Unauthorized reproduction is strictly prohibited.</p>
+                    </footer>
+                </article>
+            </body>
+            </html>
+        "#;
+
+        let extracted = extract_article_content(html, "https://example.com/apple-q4-results");
+        assert_eq!(
+            extracted.title.as_deref(),
+            Some("Apple Reports Record Q4 Revenue")
+        );
+        assert_eq!(extracted.author.as_deref(), Some("Jane Doe"));
+        assert_eq!(
+            extracted.published_time.as_deref(),
+            Some("2026-10-23T16:30:00Z")
+        );
+        assert_eq!(
+            extracted.canonical_url.as_deref(),
+            Some("https://example.com/apple-q4-results")
+        );
+        assert!(!extracted.is_excerpt);
+
+        // Core facts are preserved
+        assert!(
+            extracted
+                .body
+                .contains("reported fourth-quarter revenue of $94.9 billion")
+        );
+        assert!(
+            extracted
+                .body
+                .contains("Services revenue reached an all-time record of $25.0 billion")
+        );
+        assert!(
+            extracted
+                .body
+                .contains("returned over $29 billion to shareholders")
+        );
+
+        // Boilerplate and navigation remnants are removed
+        assert!(!extracted.body.contains("Sign In"));
+        assert!(!extracted.body.contains("Share on Twitter"));
+        assert!(!extracted.body.contains("Buy Crypto Now"));
+        assert!(!extracted.body.contains("Sign up for our daily"));
+        assert!(!extracted.body.contains("All rights reserved"));
+        assert!(!extracted.body.contains("tracking pixel"));
+        assert!(!extracted.body.contains("Home"));
+        assert!(!extracted.body.contains("Markets"));
+        assert!(!extracted.body.contains("Trending Stories"));
+    }
+
+    #[test]
+    fn test_sanitize_terminal_text_strips_ansi_and_osc() {
+        let malicious = "Normal text \x1b[31;1mRed Bold Text\x1b[0m and \x1b]0;Evil Title\x07OSC attack \x00\x08clean";
+        let sanitized = sanitize_terminal_text(malicious);
+        assert!(!sanitized.contains("\x1b"));
+        assert!(!sanitized.contains("\x07"));
+        assert!(!sanitized.contains("\x00"));
+        assert!(!sanitized.contains("\x08"));
+        assert!(sanitized.contains("Normal text"));
+        assert!(sanitized.contains("Red Bold Text"));
+        assert!(sanitized.contains("clean"));
+    }
+
+    #[test]
+    fn test_chart_data_status_labels_and_actionable_errors() {
+        assert_eq!(ChartDataStatus::NotRequested.label(), "NOT REQUESTED");
+        assert_eq!(ChartDataStatus::Loading.label(), "LOADING");
+        assert_eq!(ChartDataStatus::Ready.label(), "READY");
+        assert_eq!(ChartDataStatus::Stale.label(), "STALE CACHE");
+        assert_eq!(
+            ChartDataStatus::AuthenticationRequired.label(),
+            "AUTH REQUIRED"
+        );
+        assert_eq!(ChartDataStatus::RateLimited.label(), "RATE LIMITED");
+        assert_eq!(ChartDataStatus::Unsupported.label(), "UNSUPPORTED");
+        assert_eq!(ChartDataStatus::Error.label(), "ERROR");
+
+        assert!(!ChartDataStatus::Ready.is_actionable_error());
+        assert!(!ChartDataStatus::Loading.is_actionable_error());
+        assert!(ChartDataStatus::AuthenticationRequired.is_actionable_error());
+        assert!(ChartDataStatus::RateLimited.is_actionable_error());
+        assert!(ChartDataStatus::Error.is_actionable_error());
     }
 }

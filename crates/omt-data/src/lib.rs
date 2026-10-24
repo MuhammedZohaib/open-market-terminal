@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 use chrono::{DateTime, Utc};
 use omt_core::{
-    AssetId, Candle, DataStatus, Decimal, InstrumentInfo, Quote, Timeframe, TradingStatus,
+    AssetId, Candle, ChartDataStatus, DataStatus, Decimal, InstrumentInfo, Quote, Timeframe,
+    TradingStatus,
 };
 use std::collections::{BTreeMap, HashSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +29,8 @@ pub struct MarketState {
     pub candles: Vec<Candle>,
     pub candles_received_at: Option<DateTime<Utc>>,
     pub chart_key: String,
+    pub chart_status: ChartDataStatus,
+    pub chart_error: Option<String>,
     pub status: String,
     pub venue_status: BTreeMap<String, String>,
     pub rejected: u64,
@@ -171,6 +174,8 @@ impl MarketState {
             self.candles.drain(..self.candles.len() - max_keep);
         }
         self.candles_received_at = Some(chrono::Utc::now());
+        self.chart_status = ChartDataStatus::Ready;
+        self.chart_error = None;
     }
     pub fn merge_candles(&mut self, incoming: Vec<Candle>) {
         let mut by_time: BTreeMap<DateTime<Utc>, Candle> = BTreeMap::new();
@@ -199,6 +204,10 @@ impl MarketState {
         }
         self.candles = merged;
         self.candles_received_at = Some(chrono::Utc::now());
+        if !self.candles.is_empty() {
+            self.chart_status = ChartDataStatus::Ready;
+            self.chart_error = None;
+        }
     }
     pub fn retain(&mut self, assets: &[AssetId]) {
         let active: HashSet<_> = assets.iter().map(AssetId::key).collect();

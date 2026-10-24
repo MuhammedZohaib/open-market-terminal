@@ -4,7 +4,8 @@ pub mod views;
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use omt_core::{
-    AssetId, Company, MacroObservation, NewsCategory, NewsItem, PeriodView, Timeframe, Venue,
+    AssetId, ChartDataStatus, Company, MacroObservation, NewsCategory, NewsItem, PeriodView,
+    Timeframe, Venue,
     command::{self, Workspace},
     facts::StatementTab,
     portfolio::Transaction,
@@ -144,6 +145,8 @@ pub struct App {
     pub cursor: usize,
     pub watch_cursor: usize,
     pub input: Option<String>,
+    pub input_sug_cursor: usize,
+    pub input_sug_navigated: bool,
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub overlay: OverlayMode,
@@ -195,6 +198,13 @@ pub struct App {
     pub ascii: bool,
     pub catalog: Vec<String>,
     pub research_status: String,
+    pub global_asset: AssetId,
+    pub econ_axis_categorical: bool,
+    pub quad_focus: usize,
+    pub news_cursor: usize,
+    pub fin_cursor: usize,
+    pub econ_cursor: usize,
+    pub port_cursor: usize,
 }
 impl Default for App {
     fn default() -> Self {
@@ -205,6 +215,13 @@ impl Default for App {
             name: "Open Market Terminal".into(),
             workspace: Workspace::Market,
             asset: default_crypto.clone(),
+            global_asset: default_crypto.clone(),
+            econ_axis_categorical: true,
+            quad_focus: 0,
+            news_cursor: 0,
+            fin_cursor: 0,
+            econ_cursor: 0,
+            port_cursor: 0,
             timeframe: Timeframe::H1,
             market: MarketState {
                 status: "Starting".into(),
@@ -216,6 +233,8 @@ impl Default for App {
             cursor: 0,
             watch_cursor: 0,
             input: None,
+            input_sug_cursor: 0,
+            input_sug_navigated: false,
             history: vec![],
             history_index: None,
             overlay: OverlayMode::Sma,
@@ -376,6 +395,46 @@ impl App {
             self.news_read_ids.insert(item.id);
         }
     }
+    pub fn visible_focus_targets(&self) -> Vec<usize> {
+        if self.full_width || self.layout_mode == LayoutMode::FullWidth {
+            return vec![1];
+        }
+        let mut targets = Vec::with_capacity(3);
+        if self.show_watchlist {
+            targets.push(0);
+        }
+        targets.push(1);
+        if self.show_context {
+            targets.push(2);
+        }
+        targets
+    }
+    pub fn next_focus(&mut self) {
+        let targets = self.visible_focus_targets();
+        if targets.len() <= 1 {
+            self.focus = 1;
+            return;
+        }
+        let current_pos = targets.iter().position(|&p| p == self.focus).unwrap_or(0);
+        self.focus = targets[(current_pos + 1) % targets.len()];
+    }
+    pub fn prev_focus(&mut self) {
+        let targets = self.visible_focus_targets();
+        if targets.len() <= 1 {
+            self.focus = 1;
+            return;
+        }
+        let current_pos = targets.iter().position(|&p| p == self.focus).unwrap_or(0);
+        self.focus = targets[(current_pos + targets.len() - 1) % targets.len()];
+    }
+    pub fn focus_label(&self) -> &'static str {
+        match self.focus {
+            0 => "WATCHLIST",
+            1 => "MAIN WORKSPACE",
+            2 => "CONTEXT INSPECTOR",
+            _ => "MAIN WORKSPACE",
+        }
+    }
     pub fn key(&mut self, key: KeyEvent) -> Option<String> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
@@ -386,41 +445,71 @@ impl App {
                 KeyCode::Esc => {
                     self.input = None;
                     self.history_index = None;
+                    self.input_sug_cursor = 0;
+                    self.input_sug_navigated = false;
                 }
                 KeyCode::Enter => {
-                    let cmd = self.input.take();
+                    let sugs = get_palette_suggestions(input, &self.catalog);
+                    let final_cmd = if self.input_sug_navigated && !sugs.is_empty() {
+                        let idx = self.input_sug_cursor.min(sugs.len() - 1);
+                        sugs[idx].clone()
+                    } else {
+                        input.clone()
+                    };
+                    self.input = None;
                     self.history_index = None;
-                    if let Some(ref text) = cmd {
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty()
-                            && self.history.last().map(String::as_str) != Some(trimmed)
-                        {
-                            self.history.push(trimmed.to_string());
-                            if self.history.len() > 50 {
-                                self.history.remove(0);
-                            }
+                    self.input_sug_cursor = 0;
+                    self.input_sug_navigated = false;
+                    let trimmed = final_cmd.trim();
+                    if !trimmed.is_empty()
+                        && self.history.last().map(String::as_str) != Some(trimmed)
+                    {
+                        self.history.push(trimmed.to_string());
+                        if self.history.len() > 50 {
+                            self.history.remove(0);
                         }
                     }
-                    return cmd;
+                    return Some(final_cmd);
                 }
                 KeyCode::Backspace => {
                     input.pop();
+                    self.input_sug_cursor = 0;
+                    self.input_sug_navigated = false;
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     input.clear();
+                    self.input_sug_cursor = 0;
+                    self.input_sug_navigated = false;
                 }
                 KeyCode::Up => {
-                    if !self.history.is_empty() {
+                    let sugs = get_palette_suggestions(input, &self.catalog);
+                    if self.input_sug_navigated && !sugs.is_empty() {
+                        if self.input_sug_cursor > 0 {
+                            self.input_sug_cursor -= 1;
+                        } else {
+                            self.input_sug_navigated = false;
+                        }
+                    } else if !self.history.is_empty() {
                         let idx = match self.history_index {
                             Some(i) => i.saturating_sub(1),
                             None => self.history.len() - 1,
                         };
                         self.history_index = Some(idx);
                         *input = self.history[idx].clone();
+                        self.input_sug_cursor = 0;
+                        self.input_sug_navigated = false;
                     }
                 }
                 KeyCode::Down => {
-                    if let Some(i) = self.history_index {
+                    let sugs = get_palette_suggestions(input, &self.catalog);
+                    if !sugs.is_empty() {
+                        if !self.input_sug_navigated {
+                            self.input_sug_navigated = true;
+                            self.input_sug_cursor = 0;
+                        } else {
+                            self.input_sug_cursor = (self.input_sug_cursor + 1).min(sugs.len() - 1);
+                        }
+                    } else if let Some(i) = self.history_index {
                         if i + 1 < self.history.len() {
                             self.history_index = Some(i + 1);
                             *input = self.history[i + 1].clone();
@@ -431,11 +520,19 @@ impl App {
                     }
                 }
                 KeyCode::Tab => {
-                    if let Some(s) = command::suggestions(input, &self.catalog).first() {
-                        *input = s.clone();
+                    let sugs = get_palette_suggestions(input, &self.catalog);
+                    if !sugs.is_empty() {
+                        let idx = self.input_sug_cursor.min(sugs.len() - 1);
+                        *input = sugs[idx].clone();
+                        self.input_sug_cursor = 0;
+                        self.input_sug_navigated = false;
                     }
                 }
-                KeyCode::Char(c) => input.push(c),
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    self.input_sug_cursor = 0;
+                    self.input_sug_navigated = false;
+                }
                 _ => {}
             }
             return None;
@@ -455,10 +552,14 @@ impl App {
             KeyCode::Char('/') | KeyCode::Char(':') => {
                 self.input = Some(String::new());
                 self.history_index = None;
+                self.input_sug_cursor = 0;
+                self.input_sug_navigated = false;
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input = Some(String::new());
                 self.history_index = None;
+                self.input_sug_cursor = 0;
+                self.input_sug_navigated = false;
             }
             KeyCode::Char('?') | KeyCode::F(1) => self.help = true,
             KeyCode::F(12) => {
@@ -491,8 +592,22 @@ impl App {
                 self.workspace = target;
                 return Some(self.workspace.name().into());
             }
-            KeyCode::Tab => self.focus = (self.focus + 1) % 3,
-            KeyCode::BackTab => self.focus = (self.focus + 2) % 3,
+            KeyCode::Tab => {
+                if self.layout_mode == LayoutMode::Quad {
+                    self.quad_focus = (self.quad_focus + 1) % 4;
+                    self.message = format!("Launchpad: Focused Pane {}/4", self.quad_focus + 1);
+                } else {
+                    self.next_focus();
+                }
+            }
+            KeyCode::BackTab => {
+                if self.layout_mode == LayoutMode::Quad {
+                    self.quad_focus = (self.quad_focus + 3) % 4;
+                    self.message = format!("Launchpad: Focused Pane {}/4", self.quad_focus + 1);
+                } else {
+                    self.prev_focus();
+                }
+            }
             KeyCode::Char('z') => {
                 self.full_width = !self.full_width;
                 self.layout_mode = if self.full_width {
@@ -500,6 +615,9 @@ impl App {
                 } else {
                     LayoutMode::Standard
                 };
+                if self.full_width {
+                    self.focus = 1;
+                }
                 self.message = if self.full_width {
                     "Full-width central workspace enabled (press z to restore panels, L to cycle layouts)".into()
                 } else {
@@ -509,10 +627,16 @@ impl App {
             KeyCode::Char('L') => {
                 self.layout_mode = self.layout_mode.next();
                 self.full_width = self.layout_mode == LayoutMode::FullWidth;
+                if self.full_width {
+                    self.focus = 1;
+                }
                 self.message = format!("Workstation layout mode: {}", self.layout_mode.label());
             }
             KeyCode::Char('W') => {
                 self.show_watchlist = !self.show_watchlist;
+                if !self.show_watchlist && self.focus == 0 {
+                    self.focus = 1;
+                }
                 self.message = format!(
                     "Left Watchlist panel: {}",
                     if self.show_watchlist {
@@ -524,6 +648,9 @@ impl App {
             }
             KeyCode::Char('I') => {
                 self.show_context = !self.show_context;
+                if !self.show_context && self.focus == 2 {
+                    self.focus = 1;
+                }
                 self.message = format!(
                     "Right Context Inspector panel: {}",
                     if self.show_context {
@@ -631,6 +758,24 @@ impl App {
                 }
             }
             KeyCode::Enter => {
+                if self.layout_mode == LayoutMode::Quad {
+                    let cmd = match self.quad_focus {
+                        0 => "MARKET".into(),
+                        1 => format!("CHART {}", self.asset.key()),
+                        2 => "NEWS".into(),
+                        _ => {
+                            if self.company.is_some() {
+                                "FIN".into()
+                            } else if !self.macro_data.is_empty() {
+                                "ECON".into()
+                            } else {
+                                "PORT".into()
+                            }
+                        }
+                    };
+                    self.layout_mode = LayoutMode::Standard;
+                    return Some(cmd);
+                }
                 if self.focus == 0 {
                     if let Some(a) = self.watchlist.get(
                         self.watch_cursor
@@ -669,8 +814,23 @@ impl App {
                 self.mark_selected_news_read();
                 return Some("READ".into());
             }
-            KeyCode::Char('R') if self.workspace == Workspace::News => {
+            KeyCode::Char('R')
+                if matches!(
+                    self.workspace,
+                    Workspace::News | Workspace::Chart | Workspace::Fin
+                ) =>
+            {
                 return Some("REFRESH".into());
+            }
+            KeyCode::Char('m') if self.workspace == Workspace::Econ => {
+                self.econ_axis_categorical = !self.econ_axis_categorical;
+                self.message = if self.econ_axis_categorical {
+                    "Yield curve: Categorical Tenor Spacing active (press 'm' for proportional months)"
+                        .into()
+                } else {
+                    "Yield curve: Proportional Maturity Axis active (press 'm' for categorical tenors)"
+                        .into()
+                };
             }
             KeyCode::Char('c') if self.workspace == Workspace::News => {
                 self.news_category = self.news_category.next();
@@ -909,10 +1069,436 @@ impl App {
 }
 
 pub(crate) fn block<'a>(title: impl Into<Line<'a>>, active: bool) -> Block<'a> {
+    let border_style = if active {
+        Style::default()
+            .fg(theme::AMBER)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::INACTIVE_BORDER)
+    };
+    let border_type = if active {
+        BorderType::Thick
+    } else {
+        BorderType::Plain
+    };
     Block::bordered()
+        .border_type(border_type)
         .title(title)
-        .border_style(Style::default().fg(if active { AMBER } else { BORDER }))
+        .border_style(border_style)
         .style(Style::default().bg(PANEL_BG).fg(FG))
+}
+
+pub fn get_palette_suggestions(input: &str, catalog: &[String]) -> Vec<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return vec![
+            "TOP".into(),
+            "BTCUSDT GP".into(),
+            "AAPL FA".into(),
+            "ETHUSDT GP".into(),
+            "MARKET".into(),
+            "WEI".into(),
+            "SCAN".into(),
+            "NEWS CRYPTO".into(),
+            "PORT".into(),
+            "YCRV".into(),
+        ];
+    }
+    let query = trimmed.to_ascii_uppercase();
+    let mut exact_or_prefix = Vec::new();
+    let mut contains = Vec::new();
+
+    for cmd in command::COMMANDS {
+        let u = cmd.to_ascii_uppercase();
+        if u.starts_with(&query) {
+            exact_or_prefix.push(cmd.to_string());
+        } else if u.contains(&query) {
+            contains.push(cmd.to_string());
+        }
+    }
+    for sym in catalog {
+        let u = sym.to_ascii_uppercase();
+        if u.starts_with(&query) {
+            exact_or_prefix.push(sym.clone());
+        } else if u.contains(&query) {
+            contains.push(sym.clone());
+        }
+    }
+
+    exact_or_prefix.extend(contains);
+    exact_or_prefix.dedup();
+    exact_or_prefix.truncate(10);
+    exact_or_prefix
+}
+
+pub fn suggestion_metadata(item: &str) -> (&'static str, &'static str, Color) {
+    let upper = item.to_ascii_uppercase();
+    if upper == "TOP" {
+        (
+            "NEWS",
+            "Top Market News & Major Headlines",
+            theme::INFO_BLUE,
+        )
+    } else if upper == "WEI" {
+        ("INDICES", "World Equity Benchmark Indices", theme::AMBER)
+    } else if upper.starts_with("MARKET") || upper.starts_with("CRYPTO") || upper == "MOST" {
+        ("MARKET", "Spot Market Universe & Overview", theme::AMBER)
+    } else if upper.starts_with("CHART") || upper.ends_with(" GP") || upper.contains(" GP ") {
+        ("CHART", "High-Resolution Candlestick Graph", theme::CYAN)
+    } else if upper.starts_with("FIN")
+        || upper.ends_with(" FA")
+        || upper.contains(" FA ")
+        || upper == "FILINGS"
+        || upper == "CF"
+        || upper == "DES"
+    {
+        (
+            "FINANCIALS",
+            "SEC EDGAR Financial Facts & Filings",
+            theme::POSITIVE,
+        )
+    } else if upper.starts_with("NEWS") {
+        (
+            "NEWS",
+            "Live Multi-Source Financial News Feeds",
+            theme::INFO_BLUE,
+        )
+    } else if upper.starts_with("SCAN") || upper == "EQS" {
+        (
+            "SCREENER",
+            "Crypto & Equity Multi-Metric Screener",
+            theme::AMBER,
+        )
+    } else if upper.starts_with("PORT")
+        || upper.starts_with("BUY")
+        || upper.starts_with("SELL")
+        || upper == "ACCOUNT"
+    {
+        ("PORTFOLIO", "Local Portfolio Ledger & Orders", theme::CYAN)
+    } else if upper.starts_with("ECON")
+        || upper == "YCRV"
+        || upper.starts_with("WB")
+        || upper.starts_with("FRED")
+    {
+        (
+            "MACRO",
+            "Sovereign Yield Curves & Macro Observables",
+            theme::VIOLET,
+        )
+    } else if upper.ends_with("USDT")
+        || upper.ends_with("USDC")
+        || upper.ends_with("BTC")
+        || upper.ends_with("FDUSD")
+        || upper.ends_with("EUR")
+        || upper.contains("COINBASE:")
+    {
+        ("CRYPTO", "Binance Spot Trading Instrument", theme::CYAN)
+    } else if upper.chars().all(|c| c.is_ascii_alphabetic()) && upper.len() <= 5 {
+        ("EQUITY", "US Equities & SEC Edgar Filer", theme::POSITIVE)
+    } else {
+        ("COMMAND", "Terminal Command / Security", theme::SECONDARY)
+    }
+}
+
+fn shortcut_keycaps_for_workspace(workspace: Workspace) -> Vec<(&'static str, &'static str)> {
+    match workspace {
+        Workspace::Market => vec![
+            ("/", "Search"),
+            (":", "GO>"),
+            ("Tab", "Focus"),
+            ("Enter", "Chart"),
+            ("u", "Quote"),
+            ("l", "MinVol"),
+            ("s", "Sort"),
+            ("o", "Order"),
+            ("m", "Mode"),
+            ("w", "Watch"),
+            ("L", "Layout"),
+            ("F1", "Help"),
+        ],
+        Workspace::Chart => vec![
+            ("/", "Search"),
+            (":", "GO>"),
+            ("Tab", "Focus"),
+            ("t", "Timeframe"),
+            ("i", "Overlay"),
+            ("g", "SubInd"),
+            ("x", "Crosshair"),
+            ("+/-", "Zoom"),
+            ("h/l", "Pan"),
+            ("f", "FollowLive"),
+            ("w", "Watch"),
+            ("z", "Full"),
+            ("L", "Layout"),
+            ("F1", "Help"),
+        ],
+        Workspace::Fin => vec![
+            ("/", "Search"),
+            (":", "GO>"),
+            ("Tab", "Focus"),
+            ("a", "Annual"),
+            ("v", "Quarterly"),
+            ("s/[/]", "StmtTab"),
+            ("←/→", "Period"),
+            ("j/k", "Metric"),
+            ("d", "Profile"),
+            ("Enter", "Filing"),
+            ("L", "Layout"),
+            ("F1", "Help"),
+        ],
+        Workspace::News => vec![
+            ("/", "Search"),
+            (":", "GO>"),
+            ("Tab", "Focus"),
+            ("c", "Category"),
+            ("t", "Ticker"),
+            ("f", "FormFilter"),
+            ("Enter/r", "Read"),
+            ("R", "Refresh"),
+            ("[/]", "Scroll"),
+            ("o", "Browser"),
+            ("L", "Layout"),
+            ("F1", "Help"),
+        ],
+        Workspace::Scan => vec![
+            ("/", "Search"),
+            (":", "GO>"),
+            ("Tab", "Focus"),
+            ("m", "Crypto/Eq"),
+            ("u", "Quote"),
+            ("l", "MinVol"),
+            ("x", "Status"),
+            ("s", "Sort"),
+            ("o", "Order"),
+            ("Enter", "Open"),
+            ("L", "Layout"),
+            ("F1", "Help"),
+        ],
+        Workspace::Port => vec![
+            ("/", "Search"),
+            (":", "GO>"),
+            ("Tab", "Focus"),
+            ("j/k", "Select"),
+            ("Enter", "Chart"),
+            (":BUY/:SELL", "Orders"),
+            (":ACCOUNT", "Acct"),
+            ("L", "Layout"),
+            ("F1", "Help"),
+        ],
+        Workspace::Econ => vec![
+            ("/", "Search"),
+            (":", "GO>"),
+            ("Tab", "Focus"),
+            ("j/k", "Tenor"),
+            (":YCRV", "Treasury"),
+            (":WB", "WorldBank"),
+            (":FRED", "Fred"),
+            ("L", "Layout"),
+            ("F1", "Help"),
+        ],
+    }
+}
+
+fn render_shortcut_footer_line(workspace: Workspace, available_width: u16) -> Line<'static> {
+    let pairs = shortcut_keycaps_for_workspace(workspace);
+    let mut spans = Vec::new();
+    let mut current_len = 0;
+
+    for (key, label) in pairs {
+        let piece_len = 2 + key.len() + 2 + label.len() + 2;
+        if current_len + piece_len > available_width as usize && !spans.is_empty() {
+            break;
+        }
+        spans.push(Span::styled(
+            " [",
+            Style::default().fg(theme::INACTIVE_BORDER),
+        ));
+        spans.push(Span::styled(key, theme::keycap_style()));
+        spans.push(Span::styled(
+            "] ",
+            Style::default().fg(theme::INACTIVE_BORDER),
+        ));
+        spans.push(Span::styled(label, theme::keycap_label_style()));
+        spans.push(Span::raw("  "));
+        current_len += piece_len;
+    }
+    Line::from(spans)
+}
+
+fn render_centered_command_palette(frame: &mut Frame, app: &App, area: Rect, input: &str) {
+    let max_w = 84u16.min(area.width);
+    let popup_w = if area.width <= 40 {
+        area.width.saturating_sub(2).max(10)
+    } else {
+        (area.width.saturating_sub(4)).min(max_w)
+    };
+    let max_h = 16u16.min(area.height);
+    let popup_h = if area.height <= 10 {
+        area.height.saturating_sub(2).max(6)
+    } else {
+        (area.height.saturating_sub(2)).min(max_h)
+    };
+    let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 3;
+    let popup = Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+    frame.render_widget(Clear, popup);
+
+    let sugs = get_palette_suggestions(input, &app.catalog);
+    let count_text = if input.trim().is_empty() {
+        "Default Shortcuts".to_string()
+    } else {
+        format!("{} results", sugs.len())
+    };
+
+    let outer_block = Block::bordered()
+        .border_type(BorderType::Double)
+        .border_style(
+            Style::default()
+                .fg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(theme::ELEVATED_BG).fg(theme::FG))
+        .title(Line::from(vec![
+            Span::styled(
+                " ❯_ ",
+                Style::default().fg(theme::BG).bg(theme::AMBER).bold(),
+            ),
+            Span::styled(
+                " COMMAND RUN BAR & SYMBOL SEARCH ",
+                Style::default().fg(theme::AMBER).bold(),
+            ),
+            Span::styled(
+                format!("({count_text}) "),
+                Style::default().fg(theme::MUTED),
+            ),
+        ]))
+        .title_alignment(Alignment::Left)
+        .title(Line::from(Span::styled(
+            " [Esc] Dismiss ",
+            Style::default().fg(theme::SECONDARY),
+        )));
+
+    let inner = outer_block.inner(popup);
+    frame.render_widget(outer_block, popup);
+
+    if inner.height < 4 || inner.width < 20 {
+        return;
+    }
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let prompt_spans = vec![
+        Span::styled(" ❯ ", Style::default().fg(theme::CYAN).bold()),
+        Span::styled(input.to_string(), Style::default().fg(theme::FG).bold()),
+        Span::styled("█", Style::default().fg(theme::AMBER)),
+        Span::raw(" "),
+        if input.trim().is_empty() {
+            Span::styled(
+                "Type command (GP, FA, TOP, YCRV) or symbol (BTCUSDT, AAPL)...",
+                Style::default().fg(theme::MUTED),
+            )
+        } else {
+            Span::raw("")
+        },
+    ];
+    frame.render_widget(Paragraph::new(Line::from(prompt_spans)), chunks[0]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(chunks[1].width as usize),
+            Style::default().fg(theme::INACTIVE_BORDER),
+        ))),
+        chunks[1],
+    );
+
+    let visible_rows = chunks[2].height as usize;
+    let mut sug_lines = Vec::new();
+
+    if sugs.is_empty() {
+        sug_lines.push(Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled(
+                format!("No commands or symbols matching \"{input}\""),
+                Style::default().fg(theme::MUTED),
+            ),
+        ]));
+    } else {
+        let active_idx = if app.input_sug_navigated {
+            app.input_sug_cursor.min(sugs.len().saturating_sub(1))
+        } else {
+            usize::MAX
+        };
+
+        for (idx, item) in sugs.iter().take(visible_rows).enumerate() {
+            let is_selected = idx == active_idx;
+            let (cat, desc, cat_color) = suggestion_metadata(item);
+
+            let bg = if is_selected {
+                theme::SELECTION
+            } else {
+                theme::ELEVATED_BG
+            };
+
+            let prefix_glyph = if is_selected { " ▶ " } else { "   " };
+            let prefix_style = if is_selected {
+                Style::default().fg(theme::CYAN).bg(bg).bold()
+            } else {
+                Style::default().bg(bg)
+            };
+
+            let cat_style = Style::default().fg(cat_color).bg(bg).bold();
+            let item_style = if is_selected {
+                Style::default().fg(theme::FG).bg(bg).bold()
+            } else {
+                Style::default().fg(theme::FG).bg(bg)
+            };
+            let desc_style = Style::default()
+                .fg(if is_selected {
+                    theme::SECONDARY
+                } else {
+                    theme::MUTED
+                })
+                .bg(bg);
+
+            let cat_pill = format!("[{:^8}]", cat);
+            let item_col = format!(" {:<14}", item);
+
+            sug_lines.push(Line::from(vec![
+                Span::styled(prefix_glyph, prefix_style),
+                Span::styled(cat_pill, cat_style),
+                Span::styled(item_col, item_style),
+                Span::styled(format!(" {desc}"), desc_style),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(sug_lines), chunks[2]);
+
+    let footer_spans = vec![
+        Span::styled(" [", Style::default().fg(theme::INACTIVE_BORDER)),
+        Span::styled("Enter", theme::keycap_style()),
+        Span::styled("] ", Style::default().fg(theme::INACTIVE_BORDER)),
+        Span::styled("Execute   ", theme::keycap_label_style()),
+        Span::styled("[", Style::default().fg(theme::INACTIVE_BORDER)),
+        Span::styled("Tab", theme::keycap_style()),
+        Span::styled("] ", Style::default().fg(theme::INACTIVE_BORDER)),
+        Span::styled("Complete   ", theme::keycap_label_style()),
+        Span::styled("[", Style::default().fg(theme::INACTIVE_BORDER)),
+        Span::styled("↑/↓", theme::keycap_style()),
+        Span::styled("] ", Style::default().fg(theme::INACTIVE_BORDER)),
+        Span::styled("Select   ", theme::keycap_label_style()),
+        Span::styled("[", Style::default().fg(theme::INACTIVE_BORDER)),
+        Span::styled("Esc", theme::keycap_style()),
+        Span::styled("] ", Style::default().fg(theme::INACTIVE_BORDER)),
+        Span::styled("Dismiss", theme::keycap_label_style()),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(footer_spans)), chunks[3]);
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -1081,12 +1667,21 @@ fn render_inner(frame: &mut Frame, app: &App) {
     let quote_badge = if let Some(q) = active_quote {
         let chg = q
             .effective_change_pct()
-            .map(|p| format!(" {p:+.2}%"))
+            .map(|p| {
+                let arrow = if p > Decimal::ZERO {
+                    "▲ "
+                } else if p < Decimal::ZERO {
+                    "▼ "
+                } else {
+                    ""
+                };
+                format!(" {arrow}{p:+.2}%")
+            })
             .unwrap_or_default();
         format!(
             "{} {} {}{}",
             q.asset.key(),
-            q.price.normalize(),
+            views::format_price(q.price),
             q.currency,
             chg
         )
@@ -1100,7 +1695,7 @@ fn render_inner(frame: &mut Frame, app: &App) {
         .map(|p| theme::direction_color(Some(p)))
         .unwrap_or(FG);
 
-    let recent_trail = if app.recent_securities.len() > 1 && area.width >= 130 {
+    let recent_trail = if app.recent_securities.len() > 1 && area.width >= 135 {
         let trail_symbols: Vec<String> = app
             .recent_securities
             .iter()
@@ -1115,7 +1710,7 @@ fn render_inner(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " OMT ",
+                " OMT PRO ",
                 Style::default()
                     .fg(BG)
                     .bg(AMBER)
@@ -1125,17 +1720,18 @@ fn render_inner(frame: &mut Frame, app: &App) {
                 format!(" {} <{}> ", app.workspace.name(), app.workspace.mnemonic()),
                 Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("│ ", Style::default().fg(BORDER)),
+            Span::styled("│ ", Style::default().fg(theme::INACTIVE_BORDER)),
             Span::styled(quote_badge, Style::default().fg(quote_color).bold()),
-            Span::styled(" │ ", Style::default().fg(BORDER)),
+            Span::styled(" │ ", Style::default().fg(theme::INACTIVE_BORDER)),
             Span::styled(
                 format!("[{}] ", app.layout_mode.label()),
-                Style::default().fg(SECONDARY).bold(),
+                Style::default().fg(theme::CYAN).bold(),
             ),
             Span::styled(recent_trail, Style::default().fg(MUTED)),
             Span::styled(format!("{provider_name}: "), Style::default().fg(SECONDARY)),
+            Span::styled("● ", Style::default().fg(health_color)),
             Span::styled(feed_health, Style::default().fg(health_color)),
-            Span::styled(" │ ", Style::default().fg(BORDER)),
+            Span::styled(" │ ", Style::default().fg(theme::INACTIVE_BORDER)),
             Span::styled(
                 format!("{} UTC", Utc::now().format("%Y-%m-%d %H:%M:%S")),
                 Style::default().fg(SECONDARY),
@@ -1145,50 +1741,84 @@ fn render_inner(frame: &mut Frame, app: &App) {
         rows[0],
     );
 
-    // Row 1: Function Tabs + First-Class GO > Command Bar
-    let mut nav_spans: Vec<Span> = Workspace::ALL
-        .iter()
-        .enumerate()
-        .map(|(i, w)| {
-            let active = *w == app.workspace;
-            Span::styled(
-                format!(" {}:{}[{}] ", i + 1, w.name(), w.mnemonic()),
-                if active {
-                    Style::default()
-                        .fg(BG)
-                        .bg(AMBER)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(SECONDARY).bg(BG)
-                },
-            )
-        })
-        .collect();
-    nav_spans.push(Span::styled(" │ ", Style::default().fg(BORDER)));
-    if let Some(input) = &app.input {
+    // Row 1: High-Contrast Workspace Function Tabs & Live Keyboard Focus Ribbon
+    let is_compact_ribbon = area.width < 100;
+    let mut nav_spans = Vec::new();
+
+    for (i, w) in Workspace::ALL.iter().enumerate() {
+        let active = *w == app.workspace;
+        let num_str = format!("{}", i + 1);
+        if active {
+            let label = if is_compact_ribbon {
+                format!(" {}:{} ", num_str, w.mnemonic())
+            } else {
+                format!(" {}:{}[{}] ", num_str, w.name(), w.mnemonic())
+            };
+            nav_spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(theme::BG)
+                    .bg(theme::AMBER)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            nav_spans.push(Span::styled(" ", Style::default().bg(theme::BG)));
+            nav_spans.push(Span::styled(format!("[{num_str}]"), theme::keycap_style()));
+            let label = if is_compact_ribbon {
+                format!(":{} ", w.mnemonic())
+            } else {
+                format!(":{} ", w.name())
+            };
+            nav_spans.push(Span::styled(
+                label,
+                Style::default().fg(theme::SECONDARY).bg(theme::BG),
+            ));
+        }
+    }
+
+    nav_spans.push(Span::styled(
+        " │ ",
+        Style::default().fg(theme::INACTIVE_BORDER),
+    ));
+
+    // Active Keyboard Focus Badge
+    let (focus_label, focus_col) = match app.focus {
+        0 => ("WATCHLIST", theme::CYAN),
+        1 => ("MAIN WORKSPACE", theme::AMBER),
+        2 => ("CONTEXT INSPECTOR", theme::CYAN),
+        _ => ("MAIN WORKSPACE", theme::AMBER),
+    };
+
+    nav_spans.push(Span::styled(
+        " ⬢ FOCUS: ",
+        Style::default().fg(focus_col).bold(),
+    ));
+    nav_spans.push(Span::styled(
+        format!("{focus_label} "),
+        Style::default().fg(theme::FG).bold(),
+    ));
+    nav_spans.push(Span::styled("[Tab] ", Style::default().fg(theme::MUTED)));
+
+    nav_spans.push(Span::styled(
+        " │ ",
+        Style::default().fg(theme::INACTIVE_BORDER),
+    ));
+
+    // Quick Search Trigger Pill
+    if app.input.is_some() {
         nav_spans.push(Span::styled(
-            " GO > ",
-            Style::default()
-                .fg(BG)
-                .bg(AMBER)
-                .add_modifier(Modifier::BOLD),
-        ));
-        nav_spans.push(Span::styled(
-            format!(" {input}█ "),
-            Style::default().fg(AMBER).bg(SELECTION).bold(),
+            " ❯_ COMMAND RUN BAR ACTIVE ",
+            Style::default().fg(theme::BG).bg(theme::AMBER).bold(),
         ));
     } else {
         nav_spans.push(Span::styled(
-            " GO > ",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        ));
-        nav_spans.push(Span::styled(
-            "Enter command or security (e.g. BTCUSDT GP, AAPL FA, TOP, NEWS CRYPTO, LAUNCHPAD)",
-            Style::default().fg(MUTED),
+            " [ / ] SEARCH / GO > ",
+            theme::control_pill_style(),
         ));
     }
+
     frame.render_widget(
-        Paragraph::new(Line::from(nav_spans)).style(Style::default().bg(BG)),
+        Paragraph::new(Line::from(nav_spans)).style(Style::default().bg(theme::BG)),
         rows[1],
     );
 
@@ -1210,7 +1840,43 @@ fn render_inner(frame: &mut Frame, app: &App) {
             }
         }
         LayoutMode::Quad => {
-            if main_area.width >= 100 && main_area.height >= 16 {
+            let fourth = if app.company.is_some() {
+                Workspace::Fin
+            } else if !app.macro_data.is_empty() {
+                Workspace::Econ
+            } else {
+                Workspace::Port
+            };
+
+            if main_area.width < 90 || main_area.height < 18 {
+                let active_ws = match app.quad_focus {
+                    0 => Workspace::Market,
+                    1 => Workspace::Chart,
+                    2 => Workspace::News,
+                    _ => fourth,
+                };
+                let chunks =
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).split(main_area);
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            format!(
+                                " LAUNCHPAD 2×2 [PANE {}/4: {}] ",
+                                app.quad_focus + 1,
+                                active_ws.name()
+                            ),
+                            Style::default().fg(BG).bg(theme::CYAN).bold(),
+                        ),
+                        Span::styled(
+                            " Tab: Cycle Panes │ Enter: Full Workspace │ L: Layout Mode",
+                            Style::default().fg(SECONDARY),
+                        ),
+                    ]))
+                    .style(Style::default().bg(ELEVATED_BG)),
+                    chunks[0],
+                );
+                render_workspace_pane(frame, app, active_ws, chunks[1]);
+            } else {
                 let v_split =
                     Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
                         .split(main_area);
@@ -1220,19 +1886,19 @@ fn render_inner(frame: &mut Frame, app: &App) {
                 let bot_cols =
                     Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                         .split(v_split[1]);
+
                 render_workspace_pane(frame, app, Workspace::Market, top_cols[0]);
-                render_workspace_pane(frame, app, Workspace::Chart, top_cols[1]);
-                render_workspace_pane(frame, app, Workspace::News, bot_cols[0]);
-                let fourth = if app.company.is_some() {
-                    Workspace::Fin
-                } else if !app.macro_data.is_empty() {
-                    Workspace::Econ
+
+                if app.market.candles.is_empty()
+                    && app.market.chart_status != ChartDataStatus::Loading
+                {
+                    views::render_market_pulse_card(frame, app, top_cols[1], app.quad_focus == 1);
                 } else {
-                    Workspace::Port
-                };
+                    render_workspace_pane(frame, app, Workspace::Chart, top_cols[1]);
+                }
+
+                render_workspace_pane(frame, app, Workspace::News, bot_cols[0]);
                 render_workspace_pane(frame, app, fourth, bot_cols[1]);
-            } else {
-                main_panel(frame, app, main_area);
             }
         }
         LayoutMode::Standard => {
@@ -1277,76 +1943,25 @@ fn render_inner(frame: &mut Frame, app: &App) {
         }
     }
 
-    // Row 3: Status Line + Context-Sensitive Shortcut Footer
-    let shortcuts = match app.workspace {
-        Workspace::Market => {
-            "/ Search  : GO>  Tab Focus  Enter Chart  u QuoteCcy  l MinVol  s Sort  o Order  m Mode  w Watch  L Layout  F1 Help"
-        }
-        Workspace::Chart => {
-            "/ Search  : GO>  t Timeframe  i Overlay  g SubInd  x Crosshair  +/- Zoom  h/l Pan  f FollowLive  w Watch  z Full  L Layout"
-        }
-        Workspace::Fin => {
-            "/ Search  : GO>  a Annual  v Quarterly  s/[/] StmtTab  ←/→ Period  j/k Metric  d Profile  Enter/o Filing  L Layout"
-        }
-        Workspace::News => {
-            "/ Search  : GO>  c Category  t TickerFilter  f FormFilter  Enter/r Read  R Refresh  [/] Scroll  o Browser  L Layout"
-        }
-        Workspace::Scan => {
-            "/ Search  : GO>  m Crypto/Eq  u QuoteCcy  l MinVol  x Status  s Sort  o Order  Enter Open  L Layout  F1 Help"
-        }
-        Workspace::Port => {
-            "/ Search  : GO>  j/k Select  Enter Chart  :BUY/:SELL/:DELTX  :ACCOUNT  :IMPORT/:EXPORT  L Layout  F1 Help"
-        }
-        Workspace::Econ => {
-            "/ Search  : GO>  j/k Tenor  :YCRV (Treasury)  :WB US NY.GDP.MKTP.CD  :FRED <SERIES>  L Layout  F1 Help"
-        }
-    };
+    // Row 3: Status Message + Interactive Keycap Control Ribbon
+    let footer_shortcuts = render_shortcut_footer_line(app.workspace, area.width);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
-                Span::styled(" STATUS ", Style::default().fg(AMBER).bold()),
-                Span::styled(&app.message, Style::default().fg(FG)),
+                Span::styled(
+                    " STATUS ",
+                    Style::default().fg(theme::BG).bg(theme::AMBER).bold(),
+                ),
+                Span::styled(format!(" {}", app.message), Style::default().fg(theme::FG)),
             ]),
-            Line::from(Span::styled(
-                format!(" {shortcuts}"),
-                Style::default().fg(SECONDARY).bg(ELEVATED_BG),
-            )),
-        ]),
+            footer_shortcuts,
+        ])
+        .style(Style::default().bg(theme::BG)),
         rows[3],
     );
 
     if let Some(input) = &app.input {
-        let popup = Rect::new(
-            area.x + 2,
-            area.y + 2,
-            area.width.saturating_sub(4).min(78),
-            12.min(area.height.saturating_sub(3)),
-        );
-        frame.render_widget(Clear, popup);
-        let sugs = command::suggestions(input, &app.catalog);
-        let mut lines = vec![Line::from(vec![
-            Span::styled(" GO > ", Style::default().fg(BG).bg(AMBER).bold()),
-            Span::styled(format!(" {input}█"), Style::default().fg(AMBER).bold()),
-        ])];
-        lines.push(Line::from(Span::styled(
-            " ── Suggestions (Tab to complete, Up/Down for history, Enter to execute) ──",
-            Style::default().fg(MUTED),
-        )));
-        for (idx, s) in sugs.iter().enumerate() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if idx == 0 { " ▶ " } else { "   " },
-                    Style::default().fg(AMBER),
-                ),
-                Span::styled(s.clone(), Style::default().fg(FG)),
-            ]));
-        }
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(block(" Command & Instrument Search (<GO>) ", true))
-                .style(Style::default().bg(ELEVATED_BG).fg(FG)),
-            popup,
-        );
+        render_centered_command_palette(frame, app, area, input);
     }
     if app.diagnostics {
         let popup = Rect::new(
@@ -2163,5 +2778,361 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(text_fin.contains("SECURITY DESCRIPTION"));
+    }
+    #[test]
+    fn centered_command_palette_and_suggestion_navigation() {
+        let mut app = App::default();
+
+        // 1. Open command bar with '/'
+        app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.input.as_deref(), Some(""));
+        assert_eq!(app.input_sug_cursor, 0);
+        assert!(!app.input_sug_navigated);
+
+        // Render on 120x35 and check that centered command palette is rendered
+        let mut t = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        t.draw(|f| render(f, &app)).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("COMMAND RUN BAR & SYMBOL SEARCH"));
+        assert!(text.contains("Default Shortcuts"));
+        assert!(text.contains("TOP"));
+        assert!(text.contains("BTCUSDT GP"));
+        assert!(text.contains("[Enter] Execute"));
+        assert!(text.contains("[Tab] Complete"));
+
+        // 2. Type "BTC"
+        for c in "BTC".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.input.as_deref(), Some("BTC"));
+        assert_eq!(app.input_sug_cursor, 0);
+
+        t.draw(|f| render(f, &app)).unwrap();
+        let text_btc: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text_btc.contains("BTCUSDT"));
+        assert!(text_btc.contains("CRYPTO"));
+
+        // 3. Navigate down through suggestions
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.input_sug_navigated);
+        assert_eq!(app.input_sug_cursor, 0);
+
+        // 4. Tab autocompletes the selected suggestion
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.as_deref(), Some("BTCUSDT"));
+        assert!(!app.input_sug_navigated);
+
+        // 5. Enter executes the autocompleted command
+        let executed = app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(executed, Some("BTCUSDT".into()));
+        assert!(app.input.is_none());
+
+        // 6. Esc key dismisses opened command palette
+        app.key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        assert!(app.input.is_some());
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.input.is_none());
+    }
+    #[test]
+    fn multi_tab_navigation_and_visible_focus_cycling() {
+        let mut app = App::default();
+
+        // Standard mode: targets are [0: Watchlist, 1: Main, 2: Context]
+        assert_eq!(app.focus, 1);
+        assert_eq!(app.focus_label(), "MAIN WORKSPACE");
+
+        app.next_focus();
+        assert_eq!(app.focus, 2);
+        assert_eq!(app.focus_label(), "CONTEXT INSPECTOR");
+
+        app.next_focus();
+        assert_eq!(app.focus, 0);
+        assert_eq!(app.focus_label(), "WATCHLIST");
+
+        app.next_focus();
+        assert_eq!(app.focus, 1);
+
+        app.prev_focus();
+        assert_eq!(app.focus, 0);
+
+        // Toggle Watchlist off (W): targets become [1: Main, 2: Context]
+        app.key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::NONE));
+        assert!(!app.show_watchlist);
+        assert_eq!(app.focus, 1); // Reset from hidden panel 0 to 1
+
+        app.next_focus();
+        assert_eq!(app.focus, 2);
+        app.next_focus();
+        assert_eq!(app.focus, 1); // Skips watchlist!
+
+        // Toggle Context Inspector off (I): only [1: Main] remains
+        app.key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::NONE));
+        assert!(!app.show_context);
+        app.next_focus();
+        assert_eq!(app.focus, 1);
+        app.prev_focus();
+        assert_eq!(app.focus, 1);
+
+        // Restore panels
+        app.show_watchlist = true;
+        app.show_context = true;
+
+        // Verify Tab Ribbon and Focus Badge rendering
+        let mut t = Terminal::new(TestBackend::new(140, 35)).unwrap();
+        t.draw(|f| render(f, &app)).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("OMT PRO"));
+        assert!(text.contains("FOCUS: MAIN WORKSPACE"));
+        assert!(text.contains("[ / ] SEARCH"));
+    }
+    #[test]
+    fn command_palette_responsive_geometry_across_screen_sizes() {
+        let app = App {
+            input: Some("BTC".into()),
+            ..Default::default()
+        };
+
+        for (w, h) in [(80, 24), (120, 35), (180, 45), (240, 60)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| render(f, &app)).unwrap();
+            let text: String = t
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains("COMMAND RUN BAR"));
+            assert!(text.contains("BTC"));
+        }
+    }
+
+    #[test]
+    fn test_launchpad_adaptive_rendering_and_quad_focus_cycling() {
+        let mut app = App {
+            layout_mode: LayoutMode::Quad,
+            ..Default::default()
+        };
+
+        // Focus cycling in Quad mode
+        assert_eq!(app.quad_focus, 0);
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.quad_focus, 1);
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.quad_focus, 2);
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.quad_focus, 3);
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.quad_focus, 0);
+
+        app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.quad_focus, 3);
+
+        // Enter expands focused quadrant into full workspace
+        app.quad_focus = 0;
+        let cmd = app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(cmd, Some("MARKET".into()));
+        assert_eq!(app.layout_mode, LayoutMode::Standard);
+
+        app.layout_mode = LayoutMode::Quad;
+        app.quad_focus = 2;
+        let cmd = app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(cmd, Some("NEWS".into()));
+
+        // Responsive geometry test across screen dimensions
+        for (w, h) in [(80, 24), (100, 30), (120, 40), (160, 50), (200, 60)] {
+            app.layout_mode = LayoutMode::Quad;
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| render(f, &app)).unwrap();
+            let text: String = t
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            if w < 90 || h < 18 {
+                assert!(text.contains("LAUNCHPAD 2×2 [PANE"));
+            } else {
+                assert!(text.contains("MARKET") || text.contains("MKT"));
+                // Fallback widget appears when chart has no candles
+                assert!(text.contains("Market Pulse") || text.contains("MARKET PULSE"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_chart_diagnostics_actionable_states() {
+        let mut app = App {
+            workspace: Workspace::Chart,
+            asset: "AAPL".parse().unwrap(),
+            ..Default::default()
+        };
+
+        // 1. AuthenticationRequired
+        app.market.chart_status = ChartDataStatus::AuthenticationRequired;
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app)).unwrap();
+        let text_auth: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text_auth.contains("AUTHENTICATION REQUIRED"));
+        assert!(text_auth.contains("APCA_API_KEY_ID"));
+
+        // 2. Loading
+        app.market.chart_status = ChartDataStatus::Loading;
+        t.draw(|f| render(f, &app)).unwrap();
+        let text_load: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text_load.contains("LOADING HISTORICAL CANDLES"));
+
+        // 3. Error with actionable message
+        app.market.chart_status = ChartDataStatus::Error;
+        app.market.chart_error = Some("Connection refused by peer".into());
+        t.draw(|f| render(f, &app)).unwrap();
+        let text_err: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text_err.contains("UNABLE TO LOAD HISTORICAL CANDLES"));
+        assert!(text_err.contains("Connection refused"));
+        assert!(text_err.contains("Press 'R' to retry"));
+    }
+
+    #[test]
+    fn test_financials_secondary_analysis_region() {
+        use chrono::NaiveDate;
+        use omt_core::FinancialFact;
+
+        let facts = vec![
+            FinancialFact {
+                metric: "Revenue".into(),
+                concept: "Revenues".into(),
+                value: Decimal::from(391_035_000_000i64),
+                unit: "USD".into(),
+                start: Some(NaiveDate::from_ymd_opt(2023, 10, 1).unwrap()),
+                end: NaiveDate::from_ymd_opt(2024, 9, 28).unwrap(),
+                filed: NaiveDate::from_ymd_opt(2024, 10, 31).unwrap(),
+                accession: "0000320193-24-000106".into(),
+                form: "10-K".into(),
+                source: "SEC EDGAR".into(),
+            },
+            FinancialFact {
+                metric: "Net income".into(),
+                concept: "NetIncomeLoss".into(),
+                value: Decimal::from(93_736_000_000i64),
+                unit: "USD".into(),
+                start: Some(NaiveDate::from_ymd_opt(2023, 10, 1).unwrap()),
+                end: NaiveDate::from_ymd_opt(2024, 9, 28).unwrap(),
+                filed: NaiveDate::from_ymd_opt(2024, 10, 31).unwrap(),
+                accession: "0000320193-24-000106".into(),
+                form: "10-K".into(),
+                source: "SEC EDGAR".into(),
+            },
+        ];
+
+        let company = Company {
+            ticker: "AAPL".into(),
+            cik: 320193,
+            name: "Apple Inc.".into(),
+            facts,
+            filings: vec![],
+            fetched_at: Utc::now(),
+        };
+
+        let app = App {
+            workspace: Workspace::Fin,
+            company: Some(company),
+            ..Default::default()
+        };
+
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app)).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(text.contains("HISTORICAL TRAJECTORY"));
+        assert!(text.contains("XBRL FACT AUDIT"));
+        assert!(text.contains("Revenue"));
+    }
+
+    #[test]
+    fn test_news_three_pane_mode_on_wide_screens() {
+        let items = vec![NewsItem {
+            id: "news-wide-1".into(),
+            headline: "Treasury Yields Stable Following Economic Data".into(),
+            summary: "Treasury yields held steady after GDP report.".into(),
+            body: Some(
+                "Detailed report on treasury market dynamics and inflation expectations.".into(),
+            ),
+            source: "CNBC".into(),
+            url: "https://example.com/news/treasury".into(),
+            published_at: Utc::now(),
+            fetched_at: Utc::now(),
+            ticker: Some("US10Y".into()),
+            category: NewsCategory::Macro,
+            is_sec_filing: false,
+            form: None,
+            accession: None,
+            report_date: None,
+        }];
+
+        let app = App {
+            workspace: Workspace::News,
+            news_items: items,
+            ..Default::default()
+        };
+
+        // On 160x40 (>= 150), renders 3 panes: Headlines, Reader, and Publisher Context
+        let mut t = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        t.draw(|f| render(f, &app)).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(text.contains("Headlines"));
+        assert!(text.contains("Story & Disclosure Reader"));
+        assert!(text.contains("Story Context"));
+        assert!(text.contains("CNBC"));
+        assert!(text.contains("US10Y"));
     }
 }
