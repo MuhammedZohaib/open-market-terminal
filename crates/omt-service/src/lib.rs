@@ -69,7 +69,8 @@ mod tests {
     fn test_engine_initialization_sync_thread_online() {
         // Runs on a regular OS thread with NO pre-existing Tokio runtime
         let temp_dir = std::env::temp_dir().join(format!("omt_sync_test_{}", std::process::id()));
-        let engine = MarketEngine::new(temp_dir.clone(), false, None).expect("Engine should auto-create runtime");
+        let engine = MarketEngine::new(temp_dir.clone(), false, None)
+            .expect("Engine should auto-create runtime");
         let snap = engine.market_snapshot();
         assert_eq!(snap.total_instruments, 0);
         let _ = std::fs::remove_dir_all(temp_dir);
