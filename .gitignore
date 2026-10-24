@@ -3,6 +3,10 @@
 /.cargo/config.toml
 /.vs/
 *.sqlite*
+*.log
 .env
+.env.*
+!.env.example
 /config.toml
 /artifacts/
+

@@ -389,6 +389,11 @@ pub async fn history_before(
         }
         Venue::Iex => {
             let (key, secret) = alpaca_credentials()?;
+            let end = before_ms
+                .and_then(DateTime::from_timestamp_millis)
+                .unwrap_or_else(Utc::now);
+            // Alpaca otherwise defaults start to today, even with a large limit.
+            let start = end - chrono::Duration::seconds(tf.seconds() * 1500);
             let tf = match tf {
                 Timeframe::M1 => "1Min",
                 Timeframe::M5 => "5Min",
@@ -409,6 +414,9 @@ pub async fn history_before(
                             ("feed", "iex"),
                             ("limit", "500"),
                             ("sort", "desc"),
+                            ("start", start.to_rfc3339().as_str()),
+                            ("end", end.to_rfc3339().as_str()),
+                            ("adjustment", "raw"),
                         ])
                         .header("APCA-API-KEY-ID", key)
                         .header("APCA-API-SECRET-KEY", secret),
@@ -450,9 +458,16 @@ pub async fn catalog(http: &Http) -> Result<Vec<String>> {
         .collect())
 }
 pub fn alpaca_credentials() -> Result<(String, String)> {
+    fn credential(name: &str) -> Result<String> {
+        let value = std::env::var(name)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .with_context(|| format!("Set {name} for IEX equities"))?;
+        Ok(value.trim().to_owned())
+    }
     Ok((
-        std::env::var("APCA_API_KEY_ID").context("Set APCA_API_KEY_ID for IEX equities")?,
-        std::env::var("APCA_API_SECRET_KEY").context("Set APCA_API_SECRET_KEY for IEX equities")?,
+        credential("APCA_API_KEY_ID")?,
+        credential("APCA_API_SECRET_KEY")?,
     ))
 }
 enum FeedEvent {
@@ -622,7 +637,7 @@ pub async fn service(
                         }
                     }
                     Some(FeedEvent::Status(provider, status)) => {
-                        if status != "Live" && !status.starts_with("Optional") {
+                        if status != "Live" && !status.starts_with("Connected") && !status.starts_with("Optional") {
                             for quote in state
                                 .quotes
                                 .values_mut()
@@ -884,6 +899,20 @@ async fn stream_socket(
     assets: &[AssetId],
     tx: &mpsc::Sender<FeedEvent>,
 ) -> Result<()> {
+    let credentials = if *venue == Venue::Iex {
+        Some(alpaca_credentials()?)
+    } else {
+        None
+    };
+    stream_socket_authenticated(url, venue, assets, tx, credentials).await
+}
+async fn stream_socket_authenticated(
+    url: &str,
+    venue: &Venue,
+    assets: &[AssetId],
+    tx: &mpsc::Sender<FeedEvent>,
+    credentials: Option<(String, String)>,
+) -> Result<()> {
     let (mut socket, _) = tokio::time::timeout(Duration::from_secs(12), connect_async(url))
         .await
         .context("WebSocket connection timeout")?
@@ -902,7 +931,7 @@ async fn stream_socket(
             .await?;
     }
     if *venue == Venue::Iex {
-        let (key, secret) = alpaca_credentials()?;
+        let (key, secret) = credentials.context("Missing Alpaca credentials")?;
         socket
             .send(Message::Text(
                 json!({"action": "auth", "key": key, "secret": secret})
@@ -913,13 +942,20 @@ async fn stream_socket(
     }
     let rotate = tokio::time::sleep(Duration::from_secs(23 * 3600));
     tokio::pin!(rotate);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.tick().await;
+    let mut last_message = tokio::time::Instant::now();
     loop {
         let message = tokio::select! {
             _ = &mut rotate => return Ok(()),
-            message = tokio::time::timeout(Duration::from_secs(90), socket.next()) => {
-                message.context("Feed timed out")?.context("Feed closed")??
+            _ = heartbeat.tick() => {
+                if last_message.elapsed() >= Duration::from_secs(90) { bail!("Feed timed out"); }
+                socket.send(Message::Ping(Vec::new().into())).await?;
+                continue;
             }
+            message = socket.next() => message.context("Feed closed")??,
         };
+        last_message = tokio::time::Instant::now();
         match message {
             Message::Ping(p) => socket.send(Message::Pong(p)).await?,
             Message::Close(_) => bail!("Feed disconnected"),
@@ -1027,7 +1063,17 @@ async fn stream_socket(
                                 }
                                 bail!("Alpaca feed error {code}");
                             }
+                            if v["T"] == "subscription" {
+                                let _ = tx.try_send(FeedEvent::Status(
+                                    venue.to_string(),
+                                    "Connected / subscribed; awaiting trades".into(),
+                                ));
+                            }
                             if v["msg"] == "authenticated" {
+                                let _ = tx.try_send(FeedEvent::Status(
+                                    venue.to_string(),
+                                    "Connected / authenticated; subscribing".into(),
+                                ));
                                 socket
                                     .send(Message::Text(
                                         json!({
@@ -1124,6 +1170,59 @@ pub async fn probe(http: &Http) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn alpaca_subscription_is_connected_without_inventing_a_quote() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let auth = ws.next().await.unwrap().unwrap();
+            let value: Value = serde_json::from_str(auth.to_text().unwrap()).unwrap();
+            assert_eq!(value["action"], "auth");
+            ws.send(Message::Text(
+                r#"[{"T":"success","msg":"authenticated"}]"#.into(),
+            ))
+            .await
+            .unwrap();
+            let subscription = ws.next().await.unwrap().unwrap();
+            let value: Value = serde_json::from_str(subscription.to_text().unwrap()).unwrap();
+            assert_eq!(value["trades"][0], "AAPL");
+            ws.send(Message::Text(
+                r#"[{"T":"subscription","trades":["AAPL"],"bars":["AAPL"]}]"#.into(),
+            ))
+            .await
+            .unwrap();
+            ws.close(None).await.unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            stream_socket_authenticated(
+                &format!("ws://{address}"),
+                &Venue::Iex,
+                &["AAPL".parse().unwrap()],
+                &tx,
+                Some(("fixture-id".into(), "fixture-secret".into())),
+            ),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let mut subscribed = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                FeedEvent::Status(_, status) => {
+                    assert_ne!(status, "Live");
+                    subscribed |= status.contains("subscribed");
+                }
+                FeedEvent::Quote(_) => panic!("No trade was sent"),
+                _ => {}
+            }
+        }
+        assert!(subscribed);
+        server.await.unwrap();
+    }
     #[tokio::test]
     async fn websocket_ping_quote_and_close() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

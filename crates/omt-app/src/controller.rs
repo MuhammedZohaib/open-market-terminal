@@ -13,6 +13,7 @@ use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub enum ResearchRequest {
+    Impact(AssetId, AssetId),
     Company(String),
     Treasury,
     WorldBank(String, String),
@@ -28,7 +29,13 @@ pub struct Controller {
     pub macro_key: String,
 }
 pub fn subscription(app: &App) -> Subscription {
-    let mut assets = app.watchlist.clone();
+    let mut assets: Vec<_> = app
+        .alerts
+        .iter()
+        .filter(|a| a.triggered_at.is_none())
+        .map(|a| a.asset.clone())
+        .collect();
+    assets.extend(app.watchlist.clone());
     if let Ok(positions) = omt_core::portfolio::positions(&app.transactions) {
         assets.extend(
             positions
@@ -209,6 +216,185 @@ impl Controller {
             Command::Raw(parts) => {
                 let head = parts[0].to_ascii_uppercase();
                 match head.as_str() {
+                    "ALERT" => match parts.get(1).map(|s| s.to_ascii_uppercase()).as_deref() {
+                        None | Some("LIST") => {
+                            self.app.alerts_open = true;
+                            self.app.cursor = 0;
+                        }
+                        Some("ADD") if parts.len() == 5 => {
+                            if self.app.alerts.len() >= 40 {
+                                bail!("Maximum 40 saved alerts; remove old alerts first");
+                            }
+                            let asset = self
+                                .resolve_known_asset(parts[2].parse().map_err(anyhow::Error::msg)?);
+                            let above = match parts[3].to_ascii_uppercase().as_str() {
+                                "ABOVE" => true,
+                                "BELOW" => false,
+                                _ => bail!("Use ABOVE or BELOW"),
+                            };
+                            let threshold: rust_decimal::Decimal = parts[4].parse()?;
+                            if threshold <= rust_decimal::Decimal::ZERO {
+                                bail!("Threshold must be positive");
+                            }
+                            let id = self.app.alerts.iter().map(|a| a.id).max().unwrap_or(0) + 1;
+                            self.app.alerts.push(omt_core::alerts::PriceAlert {
+                                id,
+                                asset,
+                                above,
+                                threshold,
+                                created_at: Utc::now(),
+                                triggered_at: None,
+                                triggered_price: None,
+                            });
+                            self.store.put("alerts", "rules", &self.app.alerts)?;
+                            self.app.message = format!(
+                                "Alert #{id} armed; first fresh matching quote triggers once"
+                            );
+                        }
+                        Some("REMOVE") if parts.len() == 3 => {
+                            let id: u64 = parts[2].parse()?;
+                            if !self.app.alerts.iter().any(|a| a.id == id) {
+                                bail!("Alert ID not found");
+                            }
+                            self.app.alerts.retain(|a| a.id != id);
+                            self.store.put("alerts", "rules", &self.app.alerts)?;
+                            self.app.message = format!("Removed alert #{id}");
+                        }
+                        _ => bail!(
+                            "ALERT ADD SYMBOL ABOVE|BELOW PRICE | ALERT LIST | ALERT REMOVE ID"
+                        ),
+                    },
+                    "STUDY" => {
+                        let item = views::selected_news_item(&self.app)
+                            .context("Select a NEWS headline first")?;
+                        let symbol = match (item.category, item.ticker.as_deref()) {
+                            (NewsCategory::Macro, _) | (_, None) => self.app.asset.key(),
+                            (NewsCategory::Crypto, Some(t))
+                                if !t.contains('-')
+                                    && !t.ends_with("USDT")
+                                    && !t.ends_with("USDC") =>
+                            {
+                                format!("BINANCE:{t}USDT")
+                            }
+                            (_, Some(t)) => t.to_owned(),
+                        };
+                        let date = item.published_at.date_naive();
+                        research = self.command(&format!("IMPACT {symbol}"))?;
+                        self.app.impact_event = Some(date);
+                        self.app.impact_origin = Some(item);
+                        self.app.message = format!(
+                            "Studying selected headline date {date}; daily association only"
+                        );
+                    }
+                    "IMPACT" | "COMPARE" => {
+                        if parts.len() > 3 {
+                            bail!("IMPACT [SYMBOL] [BENCHMARK]");
+                        }
+                        if parts.len() == 1 && self.app.impact.is_some() {
+                            self.app.workspace = Workspace::Impact;
+                            return Ok(None);
+                        }
+                        let asset = parts
+                            .get(1)
+                            .map(|s| s.parse::<AssetId>().map_err(anyhow::Error::msg))
+                            .transpose()?
+                            .unwrap_or_else(|| self.app.asset.clone());
+                        let asset = self.resolve_known_asset(asset);
+                        let benchmark = parts
+                            .get(2)
+                            .map(|s| s.parse::<AssetId>().map_err(anyhow::Error::msg))
+                            .transpose()?
+                            .unwrap_or_else(|| {
+                                if asset.venue == Venue::Iex {
+                                    "IEX:SPY".parse().unwrap()
+                                } else if asset.symbol == "BTCUSDT" {
+                                    "BINANCE:ETHUSDT".parse().unwrap()
+                                } else {
+                                    "BINANCE:BTCUSDT".parse().unwrap()
+                                }
+                            });
+                        let benchmark = self.resolve_known_asset(benchmark);
+                        if asset == benchmark {
+                            bail!("Choose two different instruments for IMPACT");
+                        }
+                        self.app
+                            .workspace_history
+                            .push((self.app.workspace, self.app.asset.clone()));
+                        self.app.workspace = Workspace::Impact;
+                        self.app.set_active_asset(asset.clone());
+                        self.app.cursor = 0;
+                        self.app.impact_event = None;
+                        self.app.impact_origin = None;
+                        self.app.impact_pair = Some((asset.clone(), benchmark.clone()));
+                        let key = format!("{}|{}", asset.key(), benchmark.key());
+                        self.app.impact = self
+                            .store
+                            .get::<omt_core::impact::ImpactData>("impact", &key)?
+                            .map(|v| v.0);
+                        self.app.impact_status = if self.offline {
+                            "Offline: saved study only"
+                        } else {
+                            "Loading daily prices and related news..."
+                        }
+                        .into();
+                        research = Some(ResearchRequest::Impact(asset, benchmark));
+                    }
+                    "EVENT" => {
+                        if parts.len() != 2 {
+                            bail!("EVENT YYYY-MM-DD or EVENT CLEAR");
+                        }
+                        let date = if parts[1].eq_ignore_ascii_case("CLEAR") {
+                            None
+                        } else {
+                            Some(
+                                chrono::NaiveDate::parse_from_str(&parts[1], "%Y-%m-%d")
+                                    .context("Use EVENT YYYY-MM-DD")?,
+                            )
+                        };
+                        self.app.impact_event = date;
+                        self.app.impact_origin = None;
+                        self.app.workspace = Workspace::Impact;
+                    }
+                    "PLOT" => {
+                        if self.app.workspace == Workspace::Impact {
+                            if let Some(arg) = parts.get(1) {
+                                let arg_u = arg.to_ascii_uppercase();
+                                match arg_u.as_str() {
+                                    "REL" | "1" => self.app.impact_plot_mode = 0,
+                                    "EVENT" | "2" => self.app.impact_plot_mode = 1,
+                                    "CAR" | "3" => self.app.impact_plot_mode = 2,
+                                    "SPREAD" | "4" => self.app.impact_plot_mode = 3,
+                                    _ => bail!("PLOT [REL | EVENT | CAR | SPREAD]"),
+                                }
+                            } else {
+                                self.app.impact_plot_mode = (self.app.impact_plot_mode + 1) % 4;
+                            }
+                            let mode_desc = match self.app.impact_plot_mode {
+                                0 => {
+                                    "Relative Performance (Normalized base=100 from first common close)"
+                                }
+                                1 => {
+                                    "Event Window Trajectory (t-2 to t+5 re-indexed to baseline=100)"
+                                }
+                                2 => "Cumulative Abnormal Return / CAR (excess percentage points)",
+                                _ => {
+                                    "Daily Return Spread (Asset return % minus Benchmark return %)"
+                                }
+                            };
+                            self.app.message = format!("IMPACT Visualization Mode: {mode_desc}");
+                        } else if self.app.workspace == Workspace::Fin {
+                            self.app.fin_chart_expanded = !self.app.fin_chart_expanded;
+                            self.app.message = if self.app.fin_chart_expanded {
+                                "FIN Trends: Visual Multi-Period Income & Revenue Chart active (press 'p' for tables)".into()
+                            } else {
+                                "FIN Statements: Multi-period comparative tables active (press 'p' for charts)".into()
+                            };
+                        } else {
+                            self.app.workspace = Workspace::Chart;
+                            self.app.message = "CHART: Candlestick price chart active".into();
+                        }
+                    }
+
                     "CRYPTO" => {
                         self.app.workspace = Workspace::Market;
                         self.app.market_mode = MarketMode::Crypto;
@@ -377,16 +563,55 @@ impl Controller {
                         }
                         let key = format!("screener:{}", parts[2]);
                         match parts[1].to_ascii_uppercase().as_str() {
-                            "SAVE" => self
-                                .store
-                                .set(&key, &format!("{}|{}", self.app.filter, self.app.sort))?,
+                            "SAVE" => self.store.put(
+                                "screener_v2",
+                                &key,
+                                &(
+                                    self.app.filter.clone(),
+                                    self.app.sort.clone(),
+                                    self.app.sort_ascending,
+                                    self.app.quote_filter.clone(),
+                                    self.app.min_quote_volume,
+                                    self.app.status_filter_trading_only,
+                                    self.app.scan_mode == ScanMode::Equities,
+                                ),
+                            )?,
                             "LOAD" => {
-                                let value =
-                                    self.store.setting(&key)?.context("Preset not found")?;
-                                let (filter, sort) =
-                                    value.split_once('|').context("Invalid preset")?;
-                                self.app.filter = filter.into();
-                                self.app.sort = sort.into();
+                                type Preset = (
+                                    String,
+                                    String,
+                                    bool,
+                                    String,
+                                    rust_decimal::Decimal,
+                                    bool,
+                                    bool,
+                                );
+                                if let Some((
+                                    (filter, sort, ascending, quote, minvol, trading, equities),
+                                    _,
+                                )) = self.store.get::<Preset>("screener_v2", &key)?
+                                {
+                                    self.app.filter = filter;
+                                    self.app.sort = sort;
+                                    self.app.sort_ascending = ascending;
+                                    self.app.quote_filter = quote;
+                                    self.app.min_quote_volume = minvol;
+                                    self.app.status_filter_trading_only = trading;
+                                    self.app.scan_mode = if equities {
+                                        ScanMode::Equities
+                                    } else {
+                                        ScanMode::Crypto
+                                    };
+                                } else {
+                                    let value =
+                                        self.store.setting(&key)?.context("Preset not found")?;
+                                    let (filter, sort) =
+                                        value.split_once('|').context("Invalid preset")?;
+                                    self.app.filter = filter.into();
+                                    self.app.sort = sort.into();
+                                }
+                                self.app.cursor = 0;
+                                self.app.sync_market_selection();
                             }
                             _ => bail!("PRESET SAVE|LOAD name"),
                         }
@@ -727,6 +952,17 @@ impl Controller {
                         }
                     }
                     "REFRESH" => match self.app.workspace {
+                        Workspace::Impact => {
+                            if let Some((asset, benchmark)) = self.app.impact_pair.clone() {
+                                self.app.impact_status = if self.offline {
+                                    "Offline: saved study only"
+                                } else {
+                                    "Refreshing study..."
+                                }
+                                .into();
+                                research = Some(ResearchRequest::Impact(asset, benchmark));
+                            }
+                        }
                         Workspace::News => {
                             self.app.message =
                                 "Refreshing news feeds and regulatory filings...".into();
@@ -895,6 +1131,88 @@ impl Controller {
 mod tests {
     use super::*;
     use omt_core::{Decimal, Filing, FinancialFact};
+
+    #[test]
+    fn impact_alerts_and_complete_presets() {
+        let mut c = Controller {
+            app: App::default(),
+            store: Store::memory().unwrap(),
+            offline: true,
+            macro_key: String::new(),
+        };
+        assert!(c.command("IMPACT AAPL SPY").unwrap().is_none());
+        assert_eq!(c.app.workspace, Workspace::Impact);
+        assert_eq!(c.app.impact_pair.as_ref().unwrap().1.symbol, "SPY");
+        assert!(c.command("IMPACT AAPL AAPL").is_err());
+        c.command("EVENT 2026-01-15").unwrap();
+        assert!(c.app.impact_event.is_some());
+        assert!(c.command("EVENT 2026-02-30").is_err());
+        c.command("EVENT CLEAR").unwrap();
+        assert!(c.app.impact_event.is_none());
+        c.command("PLOT EVENT").unwrap();
+        assert_eq!(c.app.impact_plot_mode, 1);
+        c.command("PLOT CAR").unwrap();
+        assert_eq!(c.app.impact_plot_mode, 2);
+        c.command("PLOT SPREAD").unwrap();
+        assert_eq!(c.app.impact_plot_mode, 3);
+        c.command("PLOT REL").unwrap();
+        assert_eq!(c.app.impact_plot_mode, 0);
+        c.command("PLOT").unwrap();
+        assert_eq!(c.app.impact_plot_mode, 1);
+        c.command("ALERT ADD AAPL ABOVE 250").unwrap();
+        assert_eq!(
+            c.store
+                .get::<Vec<omt_core::alerts::PriceAlert>>("alerts", "rules")
+                .unwrap()
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        assert!(
+            subscription(&c.app)
+                .assets
+                .iter()
+                .any(|a| a.symbol == "AAPL")
+        );
+        assert!(c.command("ALERT ADD AAPL BELOW -1").is_err());
+        assert!(c.command("ALERT REMOVE 99").is_err());
+        c.command("ALERT REMOVE 1").unwrap();
+        assert!(c.app.alerts.is_empty());
+        c.command("SCAN EQUITIES").unwrap();
+        c.app.filter = "assets>1000".into();
+        c.app.sort = "assets".into();
+        c.app.sort_ascending = true;
+        c.app.quote_filter = "USDC".into();
+        c.app.min_quote_volume = 123.into();
+        c.app.status_filter_trading_only = false;
+        c.command("PRESET SAVE complete").unwrap();
+        c.app.filter.clear();
+        c.app.sort.clear();
+        c.app.sort_ascending = false;
+        c.app.quote_filter = "BTC".into();
+        c.app.min_quote_volume = 0.into();
+        c.app.status_filter_trading_only = true;
+        c.app.scan_mode = ScanMode::Crypto;
+        c.command("PRESET LOAD complete").unwrap();
+        assert_eq!(c.app.scan_mode, ScanMode::Equities);
+        assert_eq!(c.app.filter, "assets>1000");
+        assert_eq!(c.app.sort, "assets");
+        assert!(c.app.sort_ascending);
+        assert_eq!(c.app.quote_filter, "USDC");
+        assert_eq!(c.app.min_quote_volume, Decimal::from(123));
+        assert!(!c.app.status_filter_trading_only);
+        c.app.workspace = Workspace::News;
+        let action = c
+            .app
+            .key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('r'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .unwrap();
+        c.command(&action).unwrap();
+        assert!(c.app.news_reader_expanded);
+    }
 
     #[test]
     fn controller_commands_modes_and_cursor_reset() {

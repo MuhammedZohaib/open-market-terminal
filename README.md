@@ -8,6 +8,53 @@ This is an initial functional release, **not a claim of production certification
 See [implementation report](docs/IMPLEMENTATION_REPORT.md) for verified features,
 credential-dependent integrations, and remaining limitations.
 
+Start with the **[detailed usage guide](docs/USAGE_GUIDE.md)** for a walkthrough
+of credentials, provider checks, all eight workspaces, keyboard controls,
+portfolio CSVs, offline use, and troubleshooting.
+
+## Events, impact, and monitoring
+
+The new **IMPACT** workspace connects headlines to observed price moves:
+
+- Normalized price comparison, return correlation, beta, and 1/3/5 common-bar
+  event windows with benchmark-relative performance.
+- NEWS → **e** studies the selected headline date and preserves its source.
+- Local one-shot price alerts, saved in SQLite; complete screener presets.
+- Clearer Alpaca authentication/subscription states, idle socket keepalives,
+  explicit historical ranges, and masked credential presence in SETTINGS.
+
+No new dependencies, AI subscriptions, or model downloads are required.
+These are descriptive daily studies, **not proof that an event caused a move**.
+Read the [event research guide](docs/IMPACT.md) for methodology and limitations.
+
+```text
+IMPACT AAPL SPY
+COMPARE BINANCE:ETHUSDT BINANCE:BTCUSDT
+EVENT 2026-09-18
+EVENT CLEAR
+ALERT ADD IEX:AAPL ABOVE 250
+ALERT LIST
+ALERT REMOVE 1
+```
+
+## First session
+
+Launch from the project root. Press `:` to open the TUI command bar, type one
+command, and press Enter:
+
+| Try | Result | Setup |
+|---|---|---|
+| `CHART BTCUSDT 1H` | Public crypto candles | No key |
+| `CHART IEX:AAPL 1D` | Apple price history and IEX trade stream | Alpaca key ID and secret |
+| `FIN AAPL` | Company statements and source metadata | SEC contact identity |
+| `FRED UNRATE` | Unemployment observations in ECON | FRED API key |
+| `TREASURY` | Published Treasury yield curve | No key |
+| `SETTINGS` | Credential presence, feed status, and setup instructions | Presence does not validate access |
+
+Press `?` for help, `1`–`8` to switch workspaces, and `q` to quit. Cached values
+alone do not confirm valid credentials; follow the guide's
+[provider checks](docs/USAGE_GUIDE.md#check-your-data-providers) for a fresh test.
+
 ## Build and launch
 
 Install current stable [Rust](https://rustup.rs/). Building bundled SQLite and TLS
@@ -37,14 +84,21 @@ In this Windows workspace, a user-local Rust GNU toolchain and a compiler in
 that compiler and is deliberately ignored; other developers should use their
 own standard compiler setup. `scripts/dev.ps1` configures this session's PATH.
 
+```powershell
+.\scripts\dev.ps1 build --locked --release
+.\target\release\omt.exe
+```
+
+Close a running `omt.exe` before rebuilding the same executable on Windows.
+
 ## Seven workspaces
 
 | Workspace | Mnemonic | Function |
 |---|---|---|
-| MARKET | `MKT` / `CRYPTO` / `WEI` / `MOST` | Full Binance Spot market discovery (`3,700+` symbols, `1,380+` trading pairs), exchange-wide `!miniTicker@arr` streaming, quote-currency/liquidity/status filters, breadth & top movers (`MARKET`/`CRYPTO`), plus honest World Equity Indices reference view (`WEI`) |
+| MARKET | `MKT` / `CRYPTO` / `WEI` / `MOST` | Binance Spot market discovery, exchange-wide `!miniTicker@arr` streaming, quote-currency/liquidity/status filters, breadth & top movers (`MARKET`/`CRYPTO`), plus World Equity Indices reference view (`WEI`); symbol counts vary with provider listings |
 | CHART | `GP` / `GIP` | Actual OHLCV, terminal candles/volume, candle crosshair cursor (`[`/`]`), SMA20/50, EMA12/26, Bollinger Bands(20,2), RSI14, ATR14, MACD, VWAP, six Binance timeframes, zoom/pan |
 | FIN | `FA` / `DES` | 29 SEC US-GAAP concepts across 5 comparative multi-period statement views (`OVERVIEW`, `INCOME`, `BALANCE`, `CASH`, `RATIOS`), direct annual/quarterly periods, YoY growth, margins/FCF/ROE/ROA/liquidity ratios, source references |
-| NEWS | `CN` / `CF` | Up to 200 recent SEC submissions across 27 corporate, proxy, beneficial-ownership, and insider forms (`10-K`, `10-Q`, `8-K`, `DEF 14A`, `SD`, `13G`, `Form 4`, etc.) with report date, description, form filters, and browser launch (`Enter`/`o`) |
+| NEWS | `CN` / `CF` / `TOP` / `FILINGS` | Public financial RSS headlines, categories, article reader, and recent SEC submissions with report date, description, and form filters; `Enter` reads an item, `o` opens its source |
 | SCAN | `EQS` / `SRCH` | Dual-mode market-wide screener: `SCAN CRYPTO` across all discovered Binance Spot pairs (price, 24h%, base/quote volume, quote currency, status) and `SCAN EQUITIES` across locally indexed SEC filers (`revenue`, `income`, `assets`) |
 | PORT | `PRTU` | Multiple local accounts/watchlists, account summary bar (Market Value, Cost Basis, Unrealized & Realized P&L), decimal average-cost accounting, fees, recent fills blotter, `DELTX`, CSV import/export |
 | ECON | `ECST` / `YCRV` | Published Treasury yield curve with 2s10s/3m10s/5s30s spreads & curve regime, interactive maturity/observation table (`j/k`), World Bank series, optional FRED series, dated charts |
@@ -58,23 +112,26 @@ comprehensive news feed is claimed. Missing data is unavailable, never a fabrica
 
 | Key | Action |
 |---|---|
-| `/`, `:`, `Ctrl+P` | Open `GO >` command & symbol entry bar (`Up`/`Down` recalls history, `Ctrl+U` clears) |
-| `Tab` while editing | Complete first matching command or symbol |
+| `/`, `:`, `Ctrl+P` | Open `GO >` command & symbol entry bar (`Up` recalls history, `Down` selects available suggestions, `Ctrl+U` clears) |
+| `Tab` while editing | Complete the selected command or symbol suggestion |
 | `Tab`, `Shift+Tab` | Cycle watchlist, central workspace, and context inspector panes |
 | Arrows, `j/k`, `PgUp/PgDn`, `Home/End` | Move row selection in virtualized tables |
-| `Enter` | Execute command, open selected row in `CHART`, open `SCAN EQUITIES` row in `FIN`, or open SEC filing in browser |
+| `Enter` | Execute command; open MARKET/crypto SCAN rows in CHART, equity SCAN rows in FIN, read NEWS items, or open a FIN source |
 | `Backspace` | Return to previous workspace & instrument (`BACK`) |
 | `Esc` | Close overlay, clear candle cursor, or return focus to central panel |
-| `1`–`7`, `F2`–`F8` | Select workspace (`MARKET`, `CHART`, `FIN`, `NEWS`, `SCAN`, `PORT`, `ECON`) |
+| `1`–`8`, `F2`–`F9` | Select workspace (`MARKET`, `CHART`, `FIN`, `NEWS`, `SCAN`, `PORT`, `ECON`, `IMPACT`) |
 | `u`, `l`, `x` in MARKET/SCAN | Cycle Quote Currency (`USDT`/`USDC`/`BTC`/`FDUSD`/`EUR`/`ALL`), Min 24h Quote Volume (`l`), Trading Status (`x`) |
 | `s`, `o` in MARKET/SCAN | Cycle sort column (`s`) and toggle Ascending/Descending order (`o`) |
 | `m` in MARKET / SCAN | Cycle `Overview`/`Crypto`/`WEI` in `MARKET`, or toggle `SCAN CRYPTO` / `SCAN EQUITIES` in `SCAN` |
 | `w` | Toggle selected instrument in active watchlist |
-| `t`, `i`, `[`, `]` in CHART | Cycle timeframe (`t`), overlay (`i`), move candle crosshair cursor (`[` and `]`) |
+| `t`, `i`, `g`, `x`, `[`, `]` in CHART | Cycle timeframe (`t`), overlay (`i`), lower indicator (`g`), toggle crosshair (`x`), inspect candles (`[` and `]`) |
 | `+`, `-`, Left, Right | Zoom and pan candles in `CHART`, or select period column (`←`/`→`) in `FIN` |
 | `a`, `v`, `s`, `[`/`]` in FIN | Annual (`a`), direct quarterly (`v`), cycle statement tab (`OVERVIEW`/`INCOME`/`BALANCE`/`CASH`/`RATIOS`) |
-| `f`, `o` in NEWS | Cycle filing form filter (`ALL`/`10-K/10-Q`/`8-K`/`PROXY`/`INSIDER`), open filing URL (`o`/`Enter`) |
+| `c`, `t`, `f`, `o` in NEWS | Cycle category, toggle ticker filter, cycle filing form filter, open source URL (`o`) |
 | `z` | Toggle full-width central panel |
+| `L`, `W`, `I` | Cycle layouts, toggle watchlist, toggle context inspector (uppercase) |
+| `R` in NEWS/CHART/FIN | Request refresh; does not reload `.env` and company requests can reuse cache |
+| `F12` | Toggle diagnostics and ingest/draw telemetry |
 | `?`, `F1` | Help |
 | `q`, `Ctrl+C` | Quit / safe shutdown |
 
@@ -162,13 +219,36 @@ directory; use `--data-dir PATH` to isolate another profile.
 
 On Windows the directories are normally `%APPDATA%\OpenMarketTerminal\omt\config`
 and `%LOCALAPPDATA%\OpenMarketTerminal\omt\data`. `directories` supplies the native
-equivalents on macOS/Linux. Credentials are read from the environment only:
+equivalents on macOS/Linux. At startup the app loads `.env` from the current
+working directory or its nearest parent before starting background workers.
+Copy [.env.example](.env.example) to `.env` in the project root and fill in your
+credentials. Existing environment variables take priority over `.env` defaults.
+The local `.env` is excluded from Git; keep real keys out of tracked files.
+Edit an existing `.env` rather than copying the example over it. Remove/comment
+unused variables instead of leaving empty values. Restart after changing keys;
+rebuilding is unnecessary for credential changes. The search is relative to the
+launch directory, not the executable or `--data-dir`.
 
 | Variable | Use |
 |---|---|
 | `OMT_SEC_USER_AGENT` | App name and your maintained contact email; mandatory before SEC calls |
 | `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY` | Your Alpaca data credentials; IEX entitlement required |
 | `FRED_API_KEY` | Your own FRED API key |
+
+Alpaca powers equity/ETF price charts; FRED powers published economic series.
+An Alpaca paper-only account can access IEX market data without a funded live
+account. OMT uses `https://data.alpaca.markets/v2` for history and
+`wss://stream.data.alpaca.markets/v2/iex` for trades. The separate
+`https://paper-api.alpaca.markets/v2` endpoint is for paper trading/account
+operations; OMT does not submit broker orders.
+See [Alpaca's paper account documentation](https://docs.alpaca.markets/us/docs/paper-trading).
+
+To check keys inside the TUI, run `CHART IEX:AAPL 1D` and `FRED UNRATE`.
+Look for provider connection/fetch status rather than cached values. HTTP 401
+means rejected authentication; HTTP 403 means denied access. `SETTINGS` is an
+instruction screen, not a credential test. See the guide's
+[credential setup](docs/USAGE_GUIDE.md#credentials-and-configuration) and
+[troubleshooting](docs/USAGE_GUIDE.md#troubleshooting).
 
 SEC contact can alternatively be configured as `sec_user_agent`. No contact or
 credential is invented or shipped. [Provider matrix](docs/PROVIDERS.md) describes

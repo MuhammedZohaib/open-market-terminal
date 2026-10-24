@@ -342,6 +342,12 @@
     "rust_version": "1.56"
   },
   {
+    "name": "dotenvy",
+    "version": "0.15.7",
+    "license": "MIT",
+    "rust_version": "1.56.1"
+  },
+  {
     "name": "either",
     "version": "1.19.0",
     "license": "MIT OR Apache-2.0",

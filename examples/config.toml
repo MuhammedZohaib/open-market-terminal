@@ -2,6 +2,6 @@ name = "Open Market Terminal"
 ascii = false
 # Use a real maintained contact before SEC requests; no default identity is sent.
 # sec_user_agent = "Your Research App your-real-contact@your-domain.org"
-# Credentials are ONLY read from the environment:
+# Credentials are read from the environment (including local .env defaults):
 # APCA_API_KEY_ID, APCA_API_SECRET_KEY, FRED_API_KEY
 # OMT_SEC_USER_AGENT overrides sec_user_agent.

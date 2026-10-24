@@ -14,8 +14,8 @@ pub struct Subscription {
 impl Subscription {
     pub fn normalized(mut self) -> Self {
         self.assets.retain(|asset| *asset != self.chart);
-        self.assets.sort_by_key(AssetId::key);
-        self.assets.dedup();
+        let mut seen = HashSet::new();
+        self.assets.retain(|asset| seen.insert(asset.key()));
         self.assets.truncate(49);
         self.assets.push(self.chart.clone());
         self.assets.sort_by_key(AssetId::key);

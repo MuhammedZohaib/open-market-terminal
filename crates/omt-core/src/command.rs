@@ -8,9 +8,10 @@ pub enum Workspace {
     Scan,
     Port,
     Econ,
+    Impact,
 }
 impl Workspace {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Market,
         Self::Chart,
         Self::Fin,
@@ -18,6 +19,7 @@ impl Workspace {
         Self::Scan,
         Self::Port,
         Self::Econ,
+        Self::Impact,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -28,6 +30,7 @@ impl Workspace {
             Self::Scan => "SCAN",
             Self::Port => "PORT",
             Self::Econ => "ECON",
+            Self::Impact => "IMPACT",
         }
     }
     pub fn mnemonic(self) -> &'static str {
@@ -39,6 +42,7 @@ impl Workspace {
             Self::Scan => "EQS",
             Self::Port => "PRTU",
             Self::Econ => "ECST",
+            Self::Impact => "EVT",
         }
     }
 }
@@ -52,6 +56,15 @@ pub enum Command {
     Raw(Vec<String>),
 }
 pub const COMMANDS: &[&str] = &[
+    "ALERT",
+    "ALERT LIST",
+    "ALERT ADD",
+    "ALERT REMOVE",
+    "STUDY",
+    "IMPACT",
+    "IMPACT AAPL SPY",
+    "COMPARE",
+    "EVENT",
     "MARKET",
     "CRYPTO",
     "CRYPTO ALL",
@@ -173,6 +186,12 @@ pub fn parse(text: &str) -> Result<Command, String> {
         return Err("Enter a command or symbol".into());
     }
     let head = parts[0].to_ascii_uppercase();
+    if matches!(
+        head.as_str(),
+        "IMPACT" | "COMPARE" | "EVENT" | "STUDY" | "ALERT" | "PLOT"
+    ) {
+        return Ok(Command::Raw(parts.iter().map(|s| s.to_string()).collect()));
+    }
     if parts.len() >= 2
         && !matches!(
             head.as_str(),
@@ -324,7 +343,7 @@ pub fn parse(text: &str) -> Result<Command, String> {
         "WATCHLIST" if parts.len() == 2 => Ok(Command::Watchlist(parts[1].into())),
         "BUY" | "SELL" | "DELTX" | "IMPORT" | "EXPORT" | "WB" | "FRED" | "TREASURY" | "FILTER"
         | "SORT" | "INDEX" | "ACCOUNT" | "PRESET" | "IND" | "QUOTE" | "MINVOL" | "STATUS"
-        | "OPEN" | "READ" | "REFRESH" | "LAYOUT" | "BACK" => {
+        | "OPEN" | "READ" | "REFRESH" | "LAYOUT" | "BACK" | "PLOT" => {
             Ok(Command::Raw(parts.iter().map(|s| s.to_string()).collect()))
         }
         _ if parts.len() >= 2 => {
@@ -417,6 +436,14 @@ mod tests {
         assert!(matches!(
             parse("MARKET GAINERS"),
             Ok(Command::Raw(v)) if v == vec!["MARKET", "GAINERS"]
+        ));
+        assert!(matches!(
+            parse("PLOT EVENT"),
+            Ok(Command::Raw(v)) if v == vec!["PLOT", "EVENT"]
+        ));
+        assert!(matches!(
+            parse("PLOT"),
+            Ok(Command::Raw(v)) if v == vec!["PLOT"]
         ));
         assert_eq!(Workspace::Market.mnemonic(), "MKT");
         assert!(parse("WATCH DELETE BTCUSDT").is_err());

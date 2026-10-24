@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
+pub mod alerts;
 pub mod command;
 pub mod facts;
+pub mod impact;
 pub mod portfolio;
 use chrono::{DateTime, NaiveDate, Utc};
 pub use rust_decimal::Decimal;
@@ -1025,6 +1027,104 @@ pub struct ExtractedArticle {
 }
 
 pub fn extract_article_content(raw_html: &str, url: &str) -> ExtractedArticle {
+    extract_article_content_with_headline(raw_html, url, None)
+}
+
+fn find_matching_title_offset(raw_html: &str, candidates: &[&str]) -> Option<usize> {
+    let lower = raw_html.to_ascii_lowercase();
+
+    // 1. Look for <h1> tags and check for match against candidate titles
+    let mut search_from = 0;
+    while let Some(rel_start) = lower[search_from..].find("<h1") {
+        let h1_start = search_from + rel_start;
+        if let Some(tag_close_rel) = lower[h1_start..].find('>') {
+            let inner_start = h1_start + tag_close_rel + 1;
+            if let Some(h1_end_rel) = lower[inner_start..].find("</h1>") {
+                let inner_end = inner_start + h1_end_rel;
+                let full_h1_end = inner_end + 5;
+                let h1_text = clean_html_to_text(&raw_html[inner_start..inner_end]);
+                let h1_trimmed = h1_text.trim();
+                let h1_lower = h1_trimmed.to_ascii_lowercase();
+
+                for cand in candidates {
+                    let cand_trim = cand.trim();
+                    if cand_trim.is_empty() {
+                        continue;
+                    }
+                    let cand_lower = cand_trim.to_ascii_lowercase();
+                    if h1_lower == cand_lower
+                        || h1_lower.contains(&cand_lower)
+                        || cand_lower.contains(&h1_lower)
+                    {
+                        return Some(full_h1_end);
+                    }
+                    let cand_words: Vec<&str> = cand_lower
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|w| w.len() >= 4)
+                        .collect();
+                    let h1_words: Vec<&str> = h1_lower
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|w| w.len() >= 4)
+                        .collect();
+                    if !cand_words.is_empty() {
+                        let matched_count =
+                            cand_words.iter().filter(|w| h1_words.contains(w)).count();
+                        if matched_count >= 3
+                            || (matched_count * 2 >= cand_words.len() && matched_count >= 2)
+                        {
+                            return Some(full_h1_end);
+                        }
+                    }
+                }
+
+                // If candidate did not match directly, but this is a substantial H1 headline (>= 15 chars, >= 3 words)
+                if h1_lower.len() >= 15
+                    && h1_lower.split_whitespace().count() >= 3
+                    && !h1_lower.contains("404")
+                    && !h1_lower.contains("not found")
+                    && !h1_lower.contains("sign in")
+                    && !h1_lower.contains("cookie")
+                    && !h1_lower.contains("subscribe")
+                {
+                    return Some(full_h1_end);
+                }
+
+                search_from = full_h1_end;
+                continue;
+            }
+        }
+        search_from = h1_start + 3;
+    }
+
+    // 2. If no <h1> matched, search for candidate title text directly in HTML
+    for cand in candidates {
+        let cand_trim = cand.trim();
+        if cand_trim.len() < 10 {
+            continue;
+        }
+        let cand_lower = cand_trim.to_ascii_lowercase();
+        let words: Vec<&str> = cand_lower.split_whitespace().collect();
+        let query = if words.len() >= 4 {
+            words[..4].join(" ")
+        } else {
+            cand_lower.clone()
+        };
+        if let Some(pos) = lower.find(&query) {
+            if let Some(tag_end) = lower[pos..].find('>') {
+                return Some(pos + tag_end + 1);
+            }
+            return Some(pos + query.len());
+        }
+    }
+
+    None
+}
+
+pub fn extract_article_content_with_headline(
+    raw_html: &str,
+    url: &str,
+    expected_headline: Option<&str>,
+) -> ExtractedArticle {
     let lower = raw_html.to_ascii_lowercase();
 
     let extract_meta = |key_attr: &str, key_val: &str| -> Option<String> {
@@ -1083,7 +1183,7 @@ pub fn extract_article_content(raw_html: &str, url: &str) -> ExtractedArticle {
         None
     };
 
-    let title = extract_meta("property", "og:title")
+    let meta_title = extract_meta("property", "og:title")
         .or_else(|| extract_meta("name", "twitter:title"))
         .or_else(|| extract_meta("name", "title"))
         .or_else(|| {
@@ -1096,6 +1196,11 @@ pub fn extract_article_content(raw_html: &str, url: &str) -> ExtractedArticle {
             None
         });
 
+    let title = expected_headline
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or(meta_title);
+
     let author = extract_meta("name", "author")
         .or_else(|| extract_meta("property", "article:author"))
         .or_else(|| extract_meta("name", "byl"));
@@ -1107,7 +1212,25 @@ pub fn extract_article_content(raw_html: &str, url: &str) -> ExtractedArticle {
     let canonical_url =
         extract_link_rel("canonical").or_else(|| extract_meta("property", "og:url"));
 
-    let slice = if let Some(a_start) = lower.find("<article") {
+    // Find the matching title / headline in document and discard everything above it
+    let candidate_titles: Vec<&str> = [expected_headline, title.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let title_anchor = find_matching_title_offset(raw_html, &candidate_titles);
+
+    let slice = if let Some(anchor) = title_anchor {
+        // Discard all pre-headline header, navigation, and marquee markup
+        let after_title = &raw_html[anchor..];
+        let lower_after = &lower[anchor..];
+        if let Some(a_end) = lower_after.find("</article>") {
+            &after_title[..a_end]
+        } else if let Some(m_end) = lower_after.find("</main>") {
+            &after_title[..m_end]
+        } else {
+            after_title
+        }
+    } else if let Some(a_start) = lower.find("<article") {
         if let Some(a_end) = lower[a_start..].find("</article>") {
             &raw_html[a_start..a_start + a_end + 10]
         } else {
@@ -1133,21 +1256,68 @@ pub fn extract_article_content(raw_html: &str, url: &str) -> ExtractedArticle {
 
     let cleaned = clean_html_to_text(slice);
 
+    let is_end_of_article_marker = |line: &str| -> bool {
+        let l = line.to_ascii_lowercase();
+        let trimmed = l.trim();
+        let test_str = trimmed.trim_start_matches(['▶', '•', '│', ' ', '-', '*']);
+        test_str.starts_with("read next")
+            || test_str.starts_with("read more")
+            || test_str.starts_with("related stories")
+            || test_str.starts_with("related articles")
+            || test_str.starts_with("related posts")
+            || test_str.starts_with("more from")
+            || test_str.starts_with("more stories")
+            || test_str.starts_with("trending stories")
+            || test_str.starts_with("trending now")
+            || test_str.starts_with("popular stories")
+            || test_str.starts_with("recommended for you")
+            || test_str.starts_with("recommended stories")
+            || test_str.starts_with("around the web")
+            || test_str.starts_with("join the discussion")
+            || test_str.starts_with("comments")
+            || test_str.starts_with("leave a comment")
+            || test_str.starts_with("post a comment")
+            || test_str.starts_with("view comments")
+            || test_str.starts_with("sign up for our newsletter")
+            || test_str.starts_with("subscribe to our newsletter")
+            || test_str.starts_with("all rights reserved")
+            || test_str.starts_with("copyright ©")
+            || test_str.starts_with("© copyright")
+            || test_str.starts_with("terms of use")
+            || test_str.starts_with("terms of service")
+            || test_str.starts_with("privacy policy")
+            || test_str.starts_with("disclosures")
+            || test_str.starts_with("disclaimer:")
+            || test_str.starts_with("unauthorized reproduction is strictly prohibited")
+    };
+
     let is_boilerplate = |line: &str| -> bool {
         let l = line.to_ascii_lowercase();
-        let words: Vec<&str> = l.split_whitespace().collect();
+        let test_str = l.trim_start_matches(['▶', '•', '│', ' ', '-']);
+        let words: Vec<&str> = test_str.split_whitespace().collect();
         let count = words.len();
+        if count == 0 {
+            return true;
+        }
+        // Subheadings marked with ▶ are legitimate section dividers if >= 2 words
+        if line.starts_with('▶') && count >= 2 {
+            return false;
+        }
+        // Bullets or quotes with content are legitimate
+        if (line.starts_with('•') || line.starts_with('│')) && count >= 3 {
+            return false;
+        }
         // Eliminate single-word navigation remnants (e.g. "Home", "Markets", "News", "Share", "Like", "Follow")
         if count <= 1 {
             return true;
         }
         // Eliminate short navigation phrases (<= 3 words without sentence punctuation)
         if count <= 3
-            && !l.ends_with('.')
-            && !l.ends_with('?')
-            && !l.ends_with('!')
-            && !l.ends_with('"')
-            && !l.ends_with('\'')
+            && !test_str.ends_with('.')
+            && !test_str.ends_with('?')
+            && !test_str.ends_with('!')
+            && !test_str.ends_with('"')
+            && !test_str.ends_with('\'')
             && matches!(
                 words[0],
                 "home"
@@ -1211,47 +1381,47 @@ pub fn extract_article_content(raw_html: &str, url: &str) -> ExtractedArticle {
         }
         // Breadcrumbs, navigation paths, and sharing bars
         if count <= 10
-            && (l.contains(" > ")
-                || l.contains(" | ")
-                || l.contains(" • ")
-                || l.contains(" · ")
-                || l.contains(" » ")
-                || l.contains(" // "))
+            && (test_str.contains(" > ")
+                || test_str.contains(" | ")
+                || test_str.contains(" • ")
+                || test_str.contains(" · ")
+                || test_str.contains(" » ")
+                || test_str.contains(" // "))
         {
             return true;
         }
-        l.starts_with("sign up for")
-            || l.starts_with("sign in")
-            || l.starts_with("newsletter")
-            || l.starts_with("follow us on")
-            || l.starts_with("follow us")
-            || l.starts_with("subscribe to")
-            || l.starts_with("subscribe now")
-            || l.starts_with("all rights reserved")
-            || l.starts_with("terms of use")
-            || l.starts_with("terms of service")
-            || l.starts_with("privacy policy")
-            || l.starts_with("cookie preferences")
-            || l.starts_with("cookie policy")
-            || l.starts_with("we use cookies")
-            || l.starts_with("share this article")
-            || l.starts_with("share this")
-            || l.starts_with("share on")
-            || l.starts_with("read more:")
-            || l.starts_with("read next:")
-            || l.starts_with("click here to")
-            || l.starts_with("click here")
-            || l.starts_with("loading...")
-            || l.starts_with("advertisement")
-            || l.starts_with("ad:")
-            || l.starts_with("sponsored")
-            || l.starts_with("promoted:")
-            || l.starts_with("photo by")
-            || l.starts_with("photo credit")
-            || l.starts_with("image credit")
-            || l.starts_with("getty images")
-            || l.contains("unauthorized reproduction is strictly prohibited")
-            || l.contains("this story has been shared")
+        test_str.starts_with("sign up for")
+            || test_str.starts_with("sign in")
+            || test_str.starts_with("newsletter")
+            || test_str.starts_with("follow us on")
+            || test_str.starts_with("follow us")
+            || test_str.starts_with("subscribe to")
+            || test_str.starts_with("subscribe now")
+            || test_str.starts_with("all rights reserved")
+            || test_str.starts_with("terms of use")
+            || test_str.starts_with("terms of service")
+            || test_str.starts_with("privacy policy")
+            || test_str.starts_with("cookie preferences")
+            || test_str.starts_with("cookie policy")
+            || test_str.starts_with("we use cookies")
+            || test_str.starts_with("share this article")
+            || test_str.starts_with("share this")
+            || test_str.starts_with("share on")
+            || test_str.starts_with("read more:")
+            || test_str.starts_with("read next:")
+            || test_str.starts_with("click here to")
+            || test_str.starts_with("click here")
+            || test_str.starts_with("loading...")
+            || test_str.starts_with("advertisement")
+            || test_str.starts_with("ad:")
+            || test_str.starts_with("sponsored")
+            || test_str.starts_with("promoted:")
+            || test_str.starts_with("photo by")
+            || test_str.starts_with("photo credit")
+            || test_str.starts_with("image credit")
+            || test_str.starts_with("getty images")
+            || test_str.contains("unauthorized reproduction is strictly prohibited")
+            || test_str.contains("this story has been shared")
     };
 
     let mut filtered_paragraphs: Vec<String> = Vec::new();
@@ -1259,7 +1429,13 @@ pub fn extract_article_content(raw_html: &str, url: &str) -> ExtractedArticle {
 
     for p in cleaned.split("\n\n") {
         let trimmed = p.trim();
-        if trimmed.len() < 2 || is_boilerplate(trimmed) {
+        if trimmed.len() < 2 {
+            continue;
+        }
+        if is_end_of_article_marker(trimmed) {
+            break;
+        }
+        if is_boilerplate(trimmed) {
             continue;
         }
         if trimmed == prev_line {
@@ -1355,34 +1531,46 @@ pub fn clean_html_to_text(raw: &str) -> String {
             tag_buf.clear();
         } else if ch == '>' && in_tag {
             in_tag = false;
-            let t = tag_buf
+            let trimmed = tag_buf.trim();
+            let is_closing = trimmed.starts_with('/');
+            let t = trimmed
                 .split_whitespace()
                 .next()
                 .unwrap_or("")
                 .trim_matches('/')
                 .to_ascii_lowercase();
-            if matches!(
-                t.as_str(),
-                "p" | "div"
-                    | "br"
-                    | "tr"
-                    | "li"
-                    | "h1"
-                    | "h2"
-                    | "h3"
-                    | "h4"
-                    | "h5"
-                    | "h6"
-                    | "section"
-                    | "article"
-                    | "blockquote"
-            ) {
-                text.push('\n');
-            } else if matches!(t.as_str(), "td" | "th") {
-                text.push_str("  ");
+            if is_closing {
+                if matches!(
+                    t.as_str(),
+                    "p" | "div"
+                        | "section"
+                        | "article"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "blockquote"
+                ) {
+                    text.push_str("\n\n");
+                } else if t == "li" || t == "tr" {
+                    text.push('\n');
+                }
+            } else {
+                match t.as_str() {
+                    "p" | "section" | "article" => text.push_str("\n\n"),
+                    "br" | "tr" => text.push('\n'),
+                    "li" => text.push_str("\n• "),
+                    "h1" => text.push_str("\n\n"),
+                    "h2" | "h3" | "h4" | "h5" | "h6" => text.push_str("\n\n▶ "),
+                    "blockquote" => text.push_str("\n\n│ "),
+                    "td" | "th" => text.push_str("  "),
+                    _ => {}
+                }
             }
         } else if in_tag {
-            if tag_buf.len() < 24 {
+            if tag_buf.len() < 32 {
                 tag_buf.push(ch);
             }
         } else {
@@ -1391,10 +1579,40 @@ pub fn clean_html_to_text(raw: &str) -> String {
     }
     let decoded = decode_html_entities(&text);
     let mut paragraphs = Vec::new();
-    for line in decoded.lines() {
-        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if collapsed.len() >= 2 {
-            paragraphs.push(collapsed);
+    for block in decoded.split("\n\n") {
+        let trimmed = block.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut clean_lines = Vec::new();
+        for line in trimmed.lines() {
+            let line_trim = line.trim();
+            if line_trim.is_empty() {
+                continue;
+            }
+            let (prefix, body) = if let Some(stripped) = line_trim.strip_prefix('•') {
+                ("• ", stripped)
+            } else if let Some(stripped) = line_trim.strip_prefix('▶') {
+                ("▶ ", stripped)
+            } else if let Some(stripped) = line_trim.strip_prefix('│') {
+                ("│ ", stripped)
+            } else {
+                ("", line_trim)
+            };
+            let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !collapsed.is_empty() {
+                if prefix.is_empty() {
+                    clean_lines.push(collapsed);
+                } else {
+                    clean_lines.push(format!("{prefix}{collapsed}"));
+                }
+            }
+        }
+        if !clean_lines.is_empty() {
+            let combined = clean_lines.join("\n");
+            if combined.len() >= 2 {
+                paragraphs.push(combined);
+            }
         }
     }
     paragraphs.join("\n\n")
@@ -1698,6 +1916,76 @@ mod tests {
         assert!(!extracted.body.contains("Home"));
         assert!(!extracted.body.contains("Markets"));
         assert!(!extracted.body.contains("Trending Stories"));
+    }
+
+    #[test]
+    fn test_article_extraction_with_headline_anchoring_and_formatting() {
+        let html = r#"
+            <html>
+            <body>
+                <div class="top-nav">
+                    <span>Markets</span> | <span>Crypto</span> | <span>Tech</span>
+                    <a href="/login">Sign In</a>
+                </div>
+                <div class="trending-bar">Trending: Gold hits all-time high</div>
+                <article>
+                    <header>
+                        <h1 class="story-title">Federal Reserve Lowers Benchmark Rate by 25 Basis Points</h1>
+                        <div class="byline">By John Smith • Published October 24, 2026</div>
+                    </header>
+                    <p>The Federal Reserve lowered its benchmark interest rate by a quarter percentage point on Thursday, continuing its policy easing.</p>
+                    <h2>Economic Context</h2>
+                    <p>Officials cited moderating inflation pressures and balanced labor market conditions for the decision.</p>
+                    <ul>
+                        <li>Federal funds rate target range lowered to 4.25%-4.50%</li>
+                        <li>Discount rate adjusted downward accordingly</li>
+                    </ul>
+                    <blockquote>Inflation has made significant progress toward our two percent objective over the past year.</blockquote>
+                    <p>The committee noted that economic activity has continued to expand at a solid pace.</p>
+                    <div class="comments-section">
+                        <h3>Comments (14)</h3>
+                        <p>User1: Expected move by the Fed.</p>
+                    </div>
+                </article>
+            </body>
+            </html>
+        "#;
+        let extracted = extract_article_content_with_headline(
+            html,
+            "https://example.com/fed-cuts",
+            Some("Federal Reserve Lowers Benchmark Rate"),
+        );
+        assert_eq!(
+            extracted.title.as_deref(),
+            Some("Federal Reserve Lowers Benchmark Rate")
+        );
+        assert!(!extracted.is_excerpt);
+        // Verified facts preserved
+        assert!(
+            extracted
+                .body
+                .contains("Federal Reserve lowered its benchmark interest rate")
+        );
+        // Subheading formatted
+        assert!(extracted.body.contains("▶ Economic Context"));
+        // Bullets formatted
+        assert!(
+            extracted
+                .body
+                .contains("• Federal funds rate target range lowered")
+        );
+        // Blockquote formatted
+        assert!(
+            extracted
+                .body
+                .contains("│ Inflation has made significant progress")
+        );
+        // Pre-headline nav discarded
+        assert!(!extracted.body.contains("top-nav"));
+        assert!(!extracted.body.contains("Sign In"));
+        assert!(!extracted.body.contains("Trending: Gold"));
+        // Post-article comments discarded
+        assert!(!extracted.body.contains("User1: Expected move"));
     }
 
     #[test]

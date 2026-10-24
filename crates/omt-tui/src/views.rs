@@ -1,4 +1,49 @@
 use super::*;
+use crate::theme::CYAN;
+
+pub fn alerts(frame: &mut Frame, app: &App, area: Rect) {
+    let popup = area.inner(ratatui::layout::Margin::new(2, 2));
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![
+        Line::styled(
+            "PRICE ALERTS / Esc close / j,k scroll",
+            Style::default().fg(CYAN),
+        ),
+        Line::from("ALERT ADD AAPL ABOVE 250 | ALERT REMOVE 1"),
+        Line::from("One-shot conditions, inclusive thresholds. Runs only while this app is open."),
+        Line::from("Live quotes <=60s old only; cached or disconnected data cannot trigger."),
+        Line::from("Saved every 15s and on clean exit. IEX prices are not consolidated."),
+        Line::from(""),
+    ];
+    for alert in app.alerts.iter().skip(app.cursor) {
+        lines.push(Line::from(format!(
+            "#{} {} {} {} | {}",
+            alert.id,
+            alert.asset.key(),
+            if alert.above { "ABOVE" } else { "BELOW" },
+            alert.threshold,
+            alert
+                .triggered_at
+                .map(|t| format!(
+                    "TRIGGERED {} at {}",
+                    t.format("%m-%d %H:%M UTC"),
+                    alert.triggered_price.unwrap_or_default()
+                ))
+                .unwrap_or_else(|| "ARMED / waiting for fresh matching quote".into())
+        )));
+    }
+    if app.alerts.is_empty() {
+        lines.push(Line::from(
+            "No alerts. Add a price condition with the command bar.",
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL))
+            .style(Style::default().bg(ELEVATED_BG).fg(FG)),
+        popup,
+    );
+}
 use omt_core::{
     ChartDataStatus, DataStatus, Filing, InstrumentInfo, Quote, TradingStatus, analyze_yield_curve,
     atr, bollinger_bands, ema, facts, macd, portfolio::positions, rsi, sma, window_stats,
@@ -7,6 +52,849 @@ use rust_decimal::{
     Decimal,
     prelude::{FromPrimitive, ToPrimitive},
 };
+
+pub fn impact(frame: &mut Frame, app: &App, area: Rect) {
+    use omt_core::impact::{aligned, event_move, relationship};
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" IMPACT / Event & Benchmark Analysis [EVT] │ [p] Plot Mode: 1:RelPerf 2:EventReaction 3:CAR 4:DailySpread ")
+        .border_style(Style::default().fg(AMBER));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(data) = &app.impact else {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}\n\nQuick Commands:\n  :IMPACT AAPL SPY                       (Equities: Asset vs S&P 500 ETF)\n  :IMPACT BINANCE:ETHUSDT BINANCE:BTCUSDT (Crypto: Pair benchmark)\n  :COMPARE AAPL QQQ                      (Alias for IMPACT)\n  :EVENT YYYY-MM-DD                      (Pin specific event study date)\n  :EVENT CLEAR                           (Follow selected headline date)\n\nKeys:\n  j / k   Select headline in blotter\n  e       Pin/follow selected headline date\n  o       Open headline in web browser\n  R       Refresh daily benchmark prices\n\nMethodology & Requirements:\n  • Daily completed UTC closes; non-synchronous cross-venue closes are flagged.\n  • Association, not causation. Pre-headline daily moves are included; no forecasts.",
+                app.impact_status
+            ))
+            .style(Style::default().fg(FG))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    };
+
+    let rows = aligned(data);
+    let stats = relationship(&rows);
+
+    let number = |n: Option<f64>| {
+        n.map(|v| format!("{v:+.2}"))
+            .unwrap_or_else(|| "N/A".into())
+    };
+
+    let range = rows
+        .first()
+        .zip(rows.last())
+        .map(|(a, b)| format!("{} to {}", a.date, b.date))
+        .unwrap_or_else(|| "No shared completed dates".into());
+
+    let selected = app.impact_origin.as_ref().or_else(|| {
+        data.news
+            .get(app.cursor.min(data.news.len().saturating_sub(1)))
+    });
+    let date = app
+        .impact_event
+        .or_else(|| selected.map(|n| n.published_at.date_naive()));
+
+    // Fallback for very small terminal areas
+    if inner.height < 18 || inner.width < 50 {
+        let mut lines = vec![
+            Line::styled(
+                format!(
+                    "IMPACT: {} vs {} | DAILY",
+                    data.asset.key(),
+                    data.benchmark.key()
+                ),
+                Style::default().fg(CYAN).bold(),
+            ),
+            Line::from(format!(
+                "Correlation {}   Beta {}   Total return {}% / {}%",
+                number(stats.correlation),
+                number(stats.beta),
+                number(stats.asset_return),
+                number(stats.benchmark_return)
+            )),
+            Line::from(format!(
+                "Excess (pp): {}",
+                date.and_then(|d| event_move(&rows, d, 1))
+                    .map(|m| format!("{:+.2}", m.excess_pp))
+                    .unwrap_or_else(|| "N/A".into())
+            )),
+        ];
+        if let Some(news) = selected {
+            lines.push(Line::styled(
+                news.headline.clone(),
+                Style::default().fg(AMBER),
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+        return;
+    }
+
+    // Dynamic vertical layout based on available viewport height
+    let (top_h, table_h, chart_h) = if inner.height >= 34 {
+        (6u16, 5u16, 13u16)
+    } else if inner.height >= 24 {
+        (5u16, 5u16, 8u16)
+    } else {
+        (5u16, 5u16, 0u16)
+    };
+
+    let v_chunks = if chart_h > 0 {
+        Layout::vertical([
+            Constraint::Length(top_h),
+            Constraint::Length(table_h),
+            Constraint::Length(chart_h),
+            Constraint::Min(6),
+        ])
+        .split(inner)
+    } else {
+        Layout::vertical([
+            Constraint::Length(top_h),
+            Constraint::Length(table_h),
+            Constraint::Min(6),
+        ])
+        .split(inner)
+    };
+
+    // 1. Executive Summary KPI Cards (Horizontal 3-column split)
+    let card_cols = Layout::horizontal([
+        Constraint::Percentage(33),
+        Constraint::Percentage(37),
+        Constraint::Percentage(30),
+    ])
+    .split(v_chunks[0]);
+
+    // Card 0: Pair & Scope
+    let card0_lines = vec![
+        Line::from(vec![
+            Span::styled(data.asset.key(), Style::default().fg(CYAN).bold()),
+            Span::raw(" vs "),
+            Span::styled(data.benchmark.key(), Style::default().fg(AMBER).bold()),
+            Span::styled(" [DAILY]", Style::default().fg(MUTED)),
+        ]),
+        Line::from(vec![
+            Span::styled(range.clone(), Style::default().fg(FG)),
+            Span::styled(
+                format!(" ({} intervals)", stats.samples),
+                Style::default().fg(SECONDARY),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            format!(
+                "Saved: {} UTC │ {}",
+                data.fetched_at.format("%Y-%m-%d %H:%M"),
+                app.impact_status
+            ),
+            Style::default().fg(MUTED),
+        )]),
+    ];
+    frame.render_widget(
+        Paragraph::new(card0_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Pair & Scope ")
+                    .border_style(Style::default().fg(BORDER)),
+            )
+            .style(Style::default().bg(PANEL_BG)),
+        card_cols[0],
+    );
+
+    // Card 1: Statistical Relationship
+    let corr_color = match stats.correlation {
+        Some(c) if c > 0.0 => POSITIVE,
+        Some(c) if c < 0.0 => NEGATIVE,
+        _ => FG,
+    };
+    let card1_lines = vec![
+        Line::from(vec![
+            Span::raw("Correlation "),
+            Span::styled(
+                number(stats.correlation),
+                Style::default().fg(corr_color).bold(),
+            ),
+            Span::raw("   Beta "),
+            Span::styled(number(stats.beta), Style::default().fg(AMBER).bold()),
+        ]),
+        Line::from(vec![Span::styled(
+            format!(
+                "Total return {}% / {}%",
+                number(stats.asset_return),
+                number(stats.benchmark_return)
+            ),
+            Style::default().fg(FG),
+        )]),
+        Line::from(vec![Span::styled(
+            if stats.samples < 20 {
+                "Need 20 matched return intervals for correlation/beta.".to_string()
+            } else {
+                format!(
+                    "Excess total return: {:+.2} pp",
+                    stats.asset_return.unwrap_or(0.0) - stats.benchmark_return.unwrap_or(0.0)
+                )
+            },
+            Style::default().fg(if stats.samples < 20 { AMBER } else { SECONDARY }),
+        )]),
+    ];
+    frame.render_widget(
+        Paragraph::new(card1_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Statistical Relationship ")
+                    .border_style(Style::default().fg(BORDER)),
+            )
+            .style(Style::default().bg(PANEL_BG)),
+        card_cols[1],
+    );
+
+    // Card 2: Active Event Study Anchor
+    let mut card2_lines = vec![Line::from(vec![
+        Span::styled(
+            format!(
+                "EVENT: {}",
+                date.map(|d| d.to_string()).unwrap_or_else(|| "NONE".into())
+            ),
+            Style::default().fg(CYAN).bold(),
+        ),
+        Span::styled(
+            if app.impact_event.is_some() {
+                " [PINNED DATE]"
+            } else {
+                " [FOLLOWING HEADLINE]"
+            },
+            Style::default().fg(AMBER),
+        ),
+    ])];
+    if let Some(news) = selected {
+        card2_lines.push(Line::styled(news.headline.clone(), Style::default().fg(FG)));
+        card2_lines.push(Line::styled(
+            format!(
+                "{} │ {}",
+                news.source,
+                news.published_at.format("%Y-%m-%d %H:%M UTC")
+            ),
+            Style::default().fg(SECONDARY),
+        ));
+    } else {
+        card2_lines.push(Line::styled(
+            "No event selected. Select a headline below or type EVENT YYYY-MM-DD",
+            Style::default().fg(MUTED),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(card2_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Event Anchor ")
+                    .border_style(Style::default().fg(BORDER)),
+            )
+            .style(Style::default().bg(PANEL_BG)),
+        card_cols[2],
+    );
+
+    // 2. Event Window Impact Table
+    let table_header = Row::new(vec![
+        Cell::from("Window").style(Style::default().fg(CYAN).bold()),
+        Cell::from("Subject Move").style(Style::default().fg(CYAN).bold()),
+        Cell::from("Benchmark Move").style(Style::default().fg(AMBER).bold()),
+        Cell::from("Excess (pp)").style(Style::default().fg(FG).bold()),
+        Cell::from("Baseline -> End").style(Style::default().fg(SECONDARY).bold()),
+    ])
+    .height(1);
+
+    let mut event_rows = Vec::new();
+    if let Some(d) = date {
+        for sessions in [1, 3, 5] {
+            match event_move(&rows, d, sessions) {
+                Some(m) => {
+                    let a_color = if m.asset_pct >= 0.0 {
+                        POSITIVE
+                    } else {
+                        NEGATIVE
+                    };
+                    let b_color = if m.benchmark_pct >= 0.0 {
+                        POSITIVE
+                    } else {
+                        NEGATIVE
+                    };
+                    let x_color = if m.excess_pp >= 0.0 {
+                        POSITIVE
+                    } else {
+                        NEGATIVE
+                    };
+                    event_rows.push(Row::new(vec![
+                        Cell::from(format!("{sessions} bars")).style(Style::default().fg(FG)),
+                        Cell::from(format!("{:+8.2}%", m.asset_pct))
+                            .style(Style::default().fg(a_color)),
+                        Cell::from(format!("{:+8.2}%", m.benchmark_pct))
+                            .style(Style::default().fg(b_color)),
+                        Cell::from(format!("{:+8.2}", m.excess_pp))
+                            .style(Style::default().fg(x_color).bold()),
+                        Cell::from(format!("{} -> {}", m.baseline, m.end))
+                            .style(Style::default().fg(SECONDARY)),
+                    ]));
+                }
+                None => {
+                    event_rows.push(Row::new(vec![
+                        Cell::from(format!("{sessions} bars")).style(Style::default().fg(FG)),
+                        Cell::from("N/A - incomplete window or outside available history")
+                            .style(Style::default().fg(MUTED)),
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ]));
+                }
+            }
+        }
+    } else {
+        event_rows.push(Row::new(vec![
+            Cell::from("1 bars"),
+            Cell::from("No event date specified. Select headline or enter EVENT YYYY-MM-DD")
+                .style(Style::default().fg(MUTED)),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+        ]));
+    }
+
+    let event_table = Table::new(
+        event_rows,
+        [
+            Constraint::Length(14),
+            Constraint::Length(18),
+            Constraint::Length(18),
+            Constraint::Length(16),
+            Constraint::Min(24),
+        ],
+    )
+    .header(table_header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Event Window Abnormal / Excess Return Analysis ")
+            .border_style(Style::default().fg(BORDER)),
+    )
+    .style(Style::default().bg(PANEL_BG));
+    frame.render_widget(event_table, v_chunks[1]);
+
+    // 3. Meaningful Financial Visualizations (Comparative Plots on Demand)
+    if chart_h > 0 && rows.len() >= 2 {
+        let first = &rows[0];
+        let a: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as f64, r.asset / first.asset * 100.0))
+            .collect();
+        let b: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i as f64, r.benchmark / first.benchmark * 100.0))
+            .collect();
+        let low_rel = a
+            .iter()
+            .chain(&b)
+            .map(|p| p.1)
+            .fold(f64::INFINITY, f64::min);
+        let high_rel = a
+            .iter()
+            .chain(&b)
+            .map(|p| p.1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let pad_rel = ((high_rel - low_rel) * 0.05).max(1.0);
+        let rel_chart = Chart::new(vec![
+            Dataset::default()
+                .name(data.asset.key())
+                .data(&a)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(CYAN)),
+            Dataset::default()
+                .name(data.benchmark.key())
+                .data(&b)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(AMBER)),
+        ])
+        .hidden_legend_constraints((Constraint::Percentage(100), Constraint::Percentage(100)))
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, (rows.len() - 1) as f64])
+                .labels([
+                    first.date.to_string(),
+                    rows.last().unwrap().date.to_string(),
+                ]),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([low_rel - pad_rel, high_rel + pad_rel])
+                .labels([format!("{low_rel:.0}"), format!("{high_rel:.0}")]),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Relative performance / first common close = 100 ")
+                .border_style(Style::default().fg(BORDER)),
+        );
+
+        // Compute Event Reaction Window Trajectory & CAR if event date is available
+        let event_opt = date.and_then(|d| {
+            let e_idx = rows.iter().position(|r| r.date >= d)?;
+            let b_idx = e_idx.checked_sub(1)?;
+            let start_idx = b_idx.saturating_sub(2);
+            let end_idx = (e_idx + 4).min(rows.len().saturating_sub(1));
+            let base_asset = rows[b_idx].asset;
+            let base_bench = rows[b_idx].benchmark;
+            if base_asset <= 0.0 || base_bench <= 0.0 {
+                return None;
+            }
+            let mut react_asset = Vec::new();
+            let mut react_bench = Vec::new();
+            let mut car_pts = Vec::new();
+
+            for (idx, r) in rows.iter().enumerate().take(end_idx + 1).skip(start_idx) {
+                let x = (idx as i64 - b_idx as i64) as f64;
+                let y_a = r.asset / base_asset * 100.0;
+                let y_b = r.benchmark / base_bench * 100.0;
+                react_asset.push((x, y_a));
+                react_bench.push((x, y_b));
+                if idx >= b_idx {
+                    let car = (y_a - 100.0) - (y_b - 100.0);
+                    car_pts.push((x, car));
+                }
+            }
+            Some((
+                d,
+                b_idx,
+                start_idx,
+                end_idx,
+                react_asset,
+                react_bench,
+                car_pts,
+            ))
+        });
+
+        // Compute Daily Return Spread across series
+        let mut spread_pts = Vec::new();
+        let mut spread_zero = Vec::new();
+        for i in 1..rows.len() {
+            let x = i as f64;
+            let r_a = (rows[i].asset / rows[i - 1].asset - 1.0) * 100.0;
+            let r_b = (rows[i].benchmark / rows[i - 1].benchmark - 1.0) * 100.0;
+            spread_pts.push((x, r_a - r_b));
+            spread_zero.push((x, 0.0));
+        }
+        let spread_low = spread_pts.iter().map(|p| p.1).fold(0.0f64, f64::min);
+        let spread_high = spread_pts.iter().map(|p| p.1).fold(0.0f64, f64::max);
+        let spread_pad = ((spread_high - spread_low) * 0.1).max(0.5);
+
+        // Render side-by-side dual plots on wide screens (>= 115) or single focused plot
+        let is_wide = inner.width >= 115;
+        if is_wide {
+            let chart_cols =
+                Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)])
+                    .split(v_chunks[2]);
+
+            // Left Plot: Full Relative Performance (Macro Perspective)
+            frame.render_widget(rel_chart, chart_cols[0]);
+
+            // Right Plot: Event Reaction / CAR / Daily Spread (Micro & Diagnostic Perspective)
+            if app.impact_plot_mode == 2
+                && let Some((d, _, _, _, _, _, ref car_pts)) = event_opt
+            {
+                let car_low = car_pts.iter().map(|p| p.1).fold(0.0f64, f64::min);
+                let car_high = car_pts.iter().map(|p| p.1).fold(0.0f64, f64::max);
+                let car_pad = ((car_high - car_low) * 0.1).max(0.5);
+                let car_zero: Vec<_> = car_pts.iter().map(|p| (p.0, 0.0)).collect();
+                let car_color = if car_pts.last().map(|p| p.1 >= 0.0).unwrap_or(true) {
+                    POSITIVE
+                } else {
+                    NEGATIVE
+                };
+                let car_chart = Chart::new(vec![
+                    Dataset::default()
+                        .name("Zero Base")
+                        .data(&car_zero)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(MUTED)),
+                    Dataset::default()
+                        .name("Excess (pp)")
+                        .data(car_pts)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(car_color).bold()),
+                ])
+                .hidden_legend_constraints((
+                    Constraint::Percentage(100),
+                    Constraint::Percentage(100),
+                ))
+                .x_axis(
+                    Axis::default()
+                        .bounds([0.0, car_pts.last().map(|p| p.0).unwrap_or(5.0)])
+                        .labels([
+                            "t-1".into(),
+                            "t0 Event".into(),
+                            format!("t+{}", car_pts.len().saturating_sub(1)),
+                        ]),
+                )
+                .y_axis(
+                    Axis::default()
+                        .bounds([car_low - car_pad, car_high + car_pad])
+                        .labels([
+                            format!("{car_low:+.1}"),
+                            "0.0".into(),
+                            format!("{car_high:+.1}"),
+                        ]),
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(
+                            " Cumulative Abnormal Return / CAR (pp) around {d} "
+                        ))
+                        .border_style(Style::default().fg(car_color)),
+                );
+                frame.render_widget(car_chart, chart_cols[1]);
+            } else if app.impact_plot_mode == 3 || event_opt.is_none() {
+                let spread_chart = Chart::new(vec![
+                    Dataset::default()
+                        .name("Zero")
+                        .data(&spread_zero)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(MUTED)),
+                    Dataset::default()
+                        .name("Spread %")
+                        .data(&spread_pts)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(CYAN)),
+                ])
+                .hidden_legend_constraints((
+                    Constraint::Percentage(100),
+                    Constraint::Percentage(100),
+                ))
+                .x_axis(Axis::default().bounds([0.0, rows.len() as f64]).labels([
+                    rows.first().unwrap().date.to_string(),
+                    rows.last().unwrap().date.to_string(),
+                ]))
+                .y_axis(
+                    Axis::default()
+                        .bounds([spread_low - spread_pad, spread_high + spread_pad])
+                        .labels([format!("{spread_low:+.1}%"), format!("{spread_high:+.1}%")]),
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Daily Return Spread / Asset % - Benchmark % ")
+                        .border_style(Style::default().fg(BORDER)),
+                );
+                frame.render_widget(spread_chart, chart_cols[1]);
+            } else if let Some((d, b_idx, start_idx, end_idx, ref react_a, ref react_b, _)) =
+                event_opt
+            {
+                let min_x = (start_idx as i64 - b_idx as i64) as f64;
+                let max_x = (end_idx as i64 - b_idx as i64) as f64;
+                let ref_100 = vec![(min_x, 100.0), (max_x, 100.0)];
+                let low_react = react_a
+                    .iter()
+                    .chain(react_b)
+                    .map(|p| p.1)
+                    .fold(100.0f64, f64::min);
+                let high_react = react_a
+                    .iter()
+                    .chain(react_b)
+                    .map(|p| p.1)
+                    .fold(100.0f64, f64::max);
+                let pad_react = ((high_react - low_react) * 0.1).max(0.5);
+                let react_chart = Chart::new(vec![
+                    Dataset::default()
+                        .name("t-1 Base 100")
+                        .data(&ref_100)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(MUTED)),
+                    Dataset::default()
+                        .name(data.asset.key())
+                        .data(react_a)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(CYAN).bold()),
+                    Dataset::default()
+                        .name(data.benchmark.key())
+                        .data(react_b)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(AMBER)),
+                ])
+                .hidden_legend_constraints((
+                    Constraint::Percentage(100),
+                    Constraint::Percentage(100),
+                ))
+                .x_axis(Axis::default().bounds([min_x, max_x]).labels([
+                    format!("t-{}", b_idx - start_idx),
+                    "t-1 (Base)".into(),
+                    format!("t+{}", end_idx - b_idx),
+                ]))
+                .y_axis(
+                    Axis::default()
+                        .bounds([low_react - pad_react, high_react + pad_react])
+                        .labels([
+                            format!("{:.1}", low_react - pad_react),
+                            "100.0".into(),
+                            format!("{:.1}", high_react + pad_react),
+                        ]),
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(
+                            " Event Reaction Window ({d}) / t-1 baseline = 100 "
+                        ))
+                        .border_style(Style::default().fg(CYAN)),
+                );
+                frame.render_widget(react_chart, chart_cols[1]);
+            }
+        } else {
+            // Single focused plot on narrower screens or when toggled
+            match app.impact_plot_mode {
+                1 if event_opt.is_some() => {
+                    let (d, b_idx, start_idx, end_idx, ref react_a, ref react_b, _) =
+                        event_opt.unwrap();
+                    let min_x = (start_idx as i64 - b_idx as i64) as f64;
+                    let max_x = (end_idx as i64 - b_idx as i64) as f64;
+                    let ref_100 = vec![(min_x, 100.0), (max_x, 100.0)];
+                    let low_react = react_a
+                        .iter()
+                        .chain(react_b)
+                        .map(|p| p.1)
+                        .fold(100.0f64, f64::min);
+                    let high_react = react_a
+                        .iter()
+                        .chain(react_b)
+                        .map(|p| p.1)
+                        .fold(100.0f64, f64::max);
+                    let pad_react = ((high_react - low_react) * 0.1).max(0.5);
+                    let react_chart = Chart::new(vec![
+                        Dataset::default()
+                            .name("t-1 Base 100")
+                            .data(&ref_100)
+                            .graph_type(GraphType::Line)
+                            .style(Style::default().fg(MUTED)),
+                        Dataset::default()
+                            .name(data.asset.key())
+                            .data(react_a)
+                            .graph_type(GraphType::Line)
+                            .style(Style::default().fg(CYAN).bold()),
+                        Dataset::default()
+                            .name(data.benchmark.key())
+                            .data(react_b)
+                            .graph_type(GraphType::Line)
+                            .style(Style::default().fg(AMBER)),
+                    ])
+                    .hidden_legend_constraints((
+                        Constraint::Percentage(100),
+                        Constraint::Percentage(100),
+                    ))
+                    .x_axis(Axis::default().bounds([min_x, max_x]).labels([
+                        format!("t-{}", b_idx - start_idx),
+                        "t-1 (Base)".into(),
+                        format!("t+{}", end_idx - b_idx),
+                    ]))
+                    .y_axis(
+                        Axis::default()
+                            .bounds([low_react - pad_react, high_react + pad_react])
+                            .labels([
+                                format!("{:.1}", low_react - pad_react),
+                                "100.0".into(),
+                                format!("{:.1}", high_react + pad_react),
+                            ]),
+                    )
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!(
+                                " Event Reaction Window ({d}) / t-1 baseline = 100 "
+                            ))
+                            .border_style(Style::default().fg(CYAN)),
+                    );
+                    frame.render_widget(react_chart, v_chunks[2]);
+                }
+                2 if event_opt.is_some() => {
+                    let (d, _, _, _, _, _, ref car_pts) = event_opt.unwrap();
+                    let car_low = car_pts.iter().map(|p| p.1).fold(0.0f64, f64::min);
+                    let car_high = car_pts.iter().map(|p| p.1).fold(0.0f64, f64::max);
+                    let car_pad = ((car_high - car_low) * 0.1).max(0.5);
+                    let car_zero: Vec<_> = car_pts.iter().map(|p| (p.0, 0.0)).collect();
+                    let car_color = if car_pts.last().map(|p| p.1 >= 0.0).unwrap_or(true) {
+                        POSITIVE
+                    } else {
+                        NEGATIVE
+                    };
+                    let car_chart = Chart::new(vec![
+                        Dataset::default()
+                            .name("Zero Base")
+                            .data(&car_zero)
+                            .graph_type(GraphType::Line)
+                            .style(Style::default().fg(MUTED)),
+                        Dataset::default()
+                            .name("Excess (pp)")
+                            .data(car_pts)
+                            .graph_type(GraphType::Line)
+                            .style(Style::default().fg(car_color).bold()),
+                    ])
+                    .hidden_legend_constraints((
+                        Constraint::Percentage(100),
+                        Constraint::Percentage(100),
+                    ))
+                    .x_axis(
+                        Axis::default()
+                            .bounds([0.0, car_pts.last().map(|p| p.0).unwrap_or(5.0)])
+                            .labels([
+                                "t-1".into(),
+                                "t0 Event".into(),
+                                format!("t+{}", car_pts.len().saturating_sub(1)),
+                            ]),
+                    )
+                    .y_axis(
+                        Axis::default()
+                            .bounds([car_low - car_pad, car_high + car_pad])
+                            .labels([
+                                format!("{car_low:+.1}"),
+                                "0.0".into(),
+                                format!("{car_high:+.1}"),
+                            ]),
+                    )
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!(
+                                " Cumulative Abnormal Return / CAR (pp) around {d} "
+                            ))
+                            .border_style(Style::default().fg(car_color)),
+                    );
+                    frame.render_widget(car_chart, v_chunks[2]);
+                }
+                3 => {
+                    let spread_chart = Chart::new(vec![
+                        Dataset::default()
+                            .name("Zero")
+                            .data(&spread_zero)
+                            .graph_type(GraphType::Line)
+                            .style(Style::default().fg(MUTED)),
+                        Dataset::default()
+                            .name("Spread %")
+                            .data(&spread_pts)
+                            .graph_type(GraphType::Line)
+                            .style(Style::default().fg(CYAN)),
+                    ])
+                    .hidden_legend_constraints((
+                        Constraint::Percentage(100),
+                        Constraint::Percentage(100),
+                    ))
+                    .x_axis(Axis::default().bounds([0.0, rows.len() as f64]).labels([
+                        rows.first().unwrap().date.to_string(),
+                        rows.last().unwrap().date.to_string(),
+                    ]))
+                    .y_axis(
+                        Axis::default()
+                            .bounds([spread_low - spread_pad, spread_high + spread_pad])
+                            .labels([format!("{spread_low:+.1}%"), format!("{spread_high:+.1}%")]),
+                    )
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Daily Return Spread / Asset % - Benchmark % ")
+                            .border_style(Style::default().fg(BORDER)),
+                    );
+                    frame.render_widget(spread_chart, v_chunks[2]);
+                }
+                _ => {
+                    frame.render_widget(rel_chart, v_chunks[2]);
+                }
+            }
+        }
+    }
+
+    // 4. Event Headlines Blotter
+    let blotter_chunk = if chart_h > 0 {
+        v_chunks[3]
+    } else {
+        v_chunks[2]
+    };
+    let blotter_header = Row::new(vec![
+        Cell::from(" ").style(Style::default().fg(MUTED)),
+        Cell::from("Date").style(Style::default().fg(SECONDARY).bold()),
+        Cell::from("Source").style(Style::default().fg(AMBER).bold()),
+        Cell::from("Headline (Press 'j'/'k' to select, 'e' to pin date, 'o' to open in browser)")
+            .style(Style::default().fg(FG).bold()),
+    ])
+    .height(1);
+
+    let blotter_rows_count = blotter_chunk.height.saturating_sub(3) as usize;
+    let cursor = app.cursor.min(data.news.len().saturating_sub(1));
+    let start = cursor.saturating_sub(blotter_rows_count.saturating_sub(1) / 2);
+
+    let mut headline_rows = Vec::new();
+    for (index, news) in data
+        .news
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(blotter_rows_count)
+    {
+        let is_selected = index == cursor;
+        let marker = if is_selected { ">" } else { " " };
+        let headline_style = if is_selected {
+            Style::default().fg(CYAN).bold()
+        } else {
+            Style::default().fg(FG)
+        };
+        headline_rows.push(
+            Row::new(vec![
+                Cell::from(marker).style(if is_selected {
+                    Style::default().fg(CYAN).bold()
+                } else {
+                    Style::default().fg(MUTED)
+                }),
+                Cell::from(news.published_at.format("%m-%d").to_string())
+                    .style(Style::default().fg(SECONDARY)),
+                Cell::from(news.source.clone()).style(Style::default().fg(AMBER)),
+                Cell::from(news.headline.clone()).style(headline_style),
+            ])
+            .style(if is_selected {
+                theme::row_highlight_style()
+            } else {
+                Style::default()
+            }),
+        );
+    }
+    if headline_rows.is_empty() {
+        headline_rows.push(Row::new(vec![
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(
+                "No headlines loaded for this pair. Use EVENT YYYY-MM-DD to study known dates.",
+            )
+            .style(Style::default().fg(MUTED)),
+        ]));
+    }
+
+    let blotter_table = Table::new(
+        headline_rows,
+        [
+            Constraint::Length(2),
+            Constraint::Length(7),
+            Constraint::Length(14),
+            Constraint::Min(30),
+        ],
+    )
+    .header(blotter_header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" HEADLINES / feed context, not verified exposure / j,k select / o source ")
+            .border_style(Style::default().fg(BORDER)),
+    )
+    .style(Style::default().bg(PANEL_BG));
+    frame.render_widget(blotter_table, blotter_chunk);
+}
 
 fn with_commas(raw: &str) -> String {
     let (sign, rest) = if let Some(stripped) = raw.strip_prefix('-') {
@@ -475,6 +1363,7 @@ pub fn active_row_count(app: &App) -> usize {
             positions(&tx).map(|p| p.len()).unwrap_or(0)
         }
         Workspace::Econ => app.macro_data.len(),
+        Workspace::Impact => app.impact.as_ref().map(|d| d.news.len()).unwrap_or(0),
         Workspace::Chart => app.market.candles.len(),
     }
 }
@@ -512,6 +1401,16 @@ pub fn selected_portfolio_asset(app: &App) -> Option<String> {
 
 pub fn selected_filing_url(app: &App) -> Option<String> {
     match app.workspace {
+        Workspace::Impact => app
+            .impact_origin
+            .as_ref()
+            .or_else(|| {
+                app.impact.as_ref()?.news.get(
+                    app.cursor
+                        .min(app.impact.as_ref()?.news.len().saturating_sub(1)),
+                )
+            })
+            .map(|n| n.url.clone()),
         Workspace::News => {
             let list = filtered_news_items(app);
             list.get(app.cursor.min(list.len().saturating_sub(1)))
@@ -542,6 +1441,7 @@ pub fn main(frame: &mut Frame, app: &App, area: Rect) {
         Workspace::News => news(frame, app, area),
         Workspace::Port => portfolio(frame, app, area),
         Workspace::Econ => economics(frame, app, area),
+        Workspace::Impact => impact(frame, app, area),
     }
 }
 
@@ -1493,6 +2393,110 @@ fn render_fin_secondary_analysis(
     let audit = facts::metric_audit(&company.facts, app.period, sel_metric);
     let sel_fact = sel_row.and_then(|r| r.sources.get(active_col).copied().flatten());
 
+    if app.fin_chart_expanded && !shown_periods.is_empty() {
+        let mut rev_data = Vec::new();
+        let mut net_data = Vec::new();
+        let mut sel_data = Vec::new();
+
+        let rev_row = table.rows.iter().find(|r| r.metric.contains("Revenue"));
+        let net_row = table.rows.iter().find(|r| r.metric.contains("Net Income"));
+
+        for (i, _) in shown_periods.iter().enumerate() {
+            let x = i as f64;
+            if let Some(r) = rev_row
+                && let Some(Some(v)) = r.values.get(i)
+            {
+                rev_data.push((x, v.to_f64().unwrap_or(0.0) / 1e9));
+            }
+            if let Some(r) = net_row
+                && let Some(Some(v)) = r.values.get(i)
+            {
+                net_data.push((x, v.to_f64().unwrap_or(0.0) / 1e9));
+            }
+            if let Some(r) = sel_row
+                && let Some(Some(v)) = r.values.get(i)
+            {
+                sel_data.push((x, v.to_f64().unwrap_or(0.0) / 1e9));
+            }
+        }
+
+        let mut datasets = Vec::new();
+        if !rev_data.is_empty() {
+            datasets.push(
+                Dataset::default()
+                    .name("Revenue ($B)")
+                    .data(&rev_data)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(CYAN).bold()),
+            );
+        }
+        if !net_data.is_empty() {
+            datasets.push(
+                Dataset::default()
+                    .name("Net Income ($B)")
+                    .data(&net_data)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(AMBER).bold()),
+            );
+        }
+        if sel_metric != "Revenue" && sel_metric != "Net Income" && !sel_data.is_empty() {
+            datasets.push(
+                Dataset::default()
+                    .name(format!("{sel_metric} ($B)"))
+                    .data(&sel_data)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(POSITIVE).bold()),
+            );
+        }
+
+        if !datasets.is_empty() {
+            let low = rev_data
+                .iter()
+                .chain(&net_data)
+                .chain(&sel_data)
+                .map(|p| p.1)
+                .fold(0.0f64, f64::min);
+            let high = rev_data
+                .iter()
+                .chain(&net_data)
+                .chain(&sel_data)
+                .map(|p| p.1)
+                .fold(1.0f64, f64::max);
+            let pad = ((high - low) * 0.1).max(0.5);
+            let x_labels: Vec<String> = shown_periods
+                .iter()
+                .map(|d| d.format("%Y-%m").to_string())
+                .collect();
+
+            let fin_chart = Chart::new(datasets)
+                .hidden_legend_constraints((
+                    Constraint::Percentage(100),
+                    Constraint::Percentage(100),
+                ))
+                .x_axis(
+                    Axis::default()
+                        .bounds([0.0, shown_periods.len().saturating_sub(1) as f64])
+                        .labels(x_labels),
+                )
+                .y_axis(
+                    Axis::default()
+                        .bounds([low - pad, high + pad])
+                        .labels([format!("{low:.1}B"), format!("{high:.1}B")]),
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(
+                            " {} Financial Multi-Period Visual Trends ($B USD) │ Press 'p' to return to statement audit ",
+                            company.ticker
+                        ))
+                        .border_style(Style::default().fg(CYAN)),
+                );
+            frame.render_widget(fin_chart, area);
+            return;
+        }
+    }
+
     let cols = if area.width >= 120 {
         Layout::horizontal([
             Constraint::Percentage(34),
@@ -2275,13 +3279,36 @@ fn render_news_reader_pane(
 
     let skip_lines = app.news_scroll as usize;
     let mut current_line_idx = 0usize;
-    for p in body_paragraphs {
+    for (p_idx, p) in body_paragraphs.iter().enumerate() {
+        let p_trimmed = p.trim();
+        if p_idx == 0 && p_trimmed.eq_ignore_ascii_case(item.headline.trim()) {
+            continue;
+        }
         for l in p.lines() {
             if current_line_idx >= skip_lines {
-                lines.push(Line::from(Span::styled(
-                    l.to_string(),
-                    Style::default().fg(FG),
-                )));
+                let trimmed = l.trim();
+                let line_span = if trimmed.starts_with('▶') {
+                    Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default().fg(CYAN).bold(),
+                    ))
+                } else if trimmed.starts_with('•') {
+                    Line::from(vec![
+                        Span::styled("• ", Style::default().fg(AMBER).bold()),
+                        Span::styled(
+                            trimmed.trim_start_matches(['•', ' ']).to_string(),
+                            Style::default().fg(FG),
+                        ),
+                    ])
+                } else if trimmed.starts_with('│') {
+                    Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default().fg(Color::Rgb(160, 205, 230)),
+                    ))
+                } else {
+                    Line::from(Span::styled(l.to_string(), Style::default().fg(FG)))
+                };
+                lines.push(line_span);
             }
             current_line_idx += 1;
         }
@@ -2548,10 +3575,20 @@ pub fn portfolio(frame: &mut Frame, app: &App, area: Rect) {
         ])
     });
 
-    let holdings_h = (positions.len() as u16 + 4).clamp(6, area.height.saturating_sub(10).max(6));
+    let (header_h, holdings_h) = if area.height >= 20 {
+        (
+            4u16,
+            (positions.len() as u16 + 4).clamp(6, area.height.saturating_sub(11).max(6)),
+        )
+    } else {
+        (
+            3u16,
+            (positions.len() as u16 + 4).clamp(6, area.height.saturating_sub(10).max(6)),
+        )
+    };
     let rows = if area.height >= 16 {
         Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(header_h),
             Constraint::Length(holdings_h),
             Constraint::Min(6),
         ])
@@ -2565,28 +3602,60 @@ pub fn portfolio(frame: &mut Frame, app: &App, area: Rect) {
         .split(area)
     };
 
+    let mut header_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(" PORTFOLIO <PRTU> — Account: {} ", app.account),
+                Style::default().fg(BG).bg(AMBER).bold(),
+            ),
+            Span::styled(
+                format!(
+                    "  {} open positions │ {} recorded fills",
+                    positions.len(),
+                    transactions.len()
+                ),
+                Style::default().fg(FG),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!(" {summary_text}"),
+            Style::default().fg(SECONDARY),
+        )),
+    ];
+
+    if header_h >= 4 {
+        let mut alloc_spans = vec![Span::styled(" Allocation: ", Style::default().fg(MUTED))];
+        for p in &positions {
+            let q = app.market.quotes.get(&p.asset.key());
+            let valid =
+                q.filter(|q| matches!(q.status_at(now), DataStatus::Live | DataStatus::Delayed));
+            if let Some(q) = valid
+                && let Some((total_mv, ..)) = totals.get(&p.currency)
+                && *total_mv > Decimal::ZERO
+            {
+                let weight_pct = (p.quantity * q.price / *total_mv * Decimal::from(100))
+                    .to_f64()
+                    .unwrap_or(0.0);
+                if weight_pct >= 0.5 {
+                    let bar_len = ((weight_pct / 100.0) * 12.0).round().max(1.0) as usize;
+                    alloc_spans.push(Span::styled(
+                        format!(" {} ", p.asset.symbol),
+                        Style::default().fg(AMBER).bold(),
+                    ));
+                    alloc_spans.push(Span::styled(
+                        format!("{weight_pct:.1}% "),
+                        Style::default().fg(FG),
+                    ));
+                    alloc_spans.push(Span::styled("█".repeat(bar_len), Style::default().fg(CYAN)));
+                    alloc_spans.push(Span::raw(" "));
+                }
+            }
+        }
+        header_lines.push(Line::from(alloc_spans));
+    }
+
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!(" PORTFOLIO <PRTU> — Account: {} ", app.account),
-                    Style::default().fg(BG).bg(AMBER).bold(),
-                ),
-                Span::styled(
-                    format!(
-                        "  {} open positions │ {} recorded fills",
-                        positions.len(),
-                        transactions.len()
-                    ),
-                    Style::default().fg(FG),
-                ),
-            ]),
-            Line::from(Span::styled(
-                format!(" {summary_text}"),
-                Style::default().fg(SECONDARY),
-            )),
-        ])
-        .style(Style::default().bg(ELEVATED_BG)),
+        Paragraph::new(header_lines).style(Style::default().bg(ELEVATED_BG)),
         rows[0],
     );
 
@@ -3158,6 +4227,27 @@ fn unavailable(frame: &mut Frame, app: &App, area: Rect, text: &str) {
     );
 }
 
+fn equity_auth_diagnostic(app: &App) -> (&'static str, &'static str) {
+    match app.market.chart_error.as_deref().unwrap_or("") {
+        error if error.contains("401") => (
+            "ALPACA REJECTED CREDENTIALS (HTTP 401)",
+            "Both credentials were loaded, but Alpaca rejected the request.\n\
+             Verify APCA_API_KEY_ID and APCA_API_SECRET_KEY are a matching pair in .env.\n\
+             Restart the app after changing .env.",
+        ),
+        error if error.contains("403") => (
+            "ALPACA DATA ACCESS DENIED (HTTP 403)",
+            "Alpaca denied this data request. Check your account's IEX data permissions.\n\
+             If you change credentials in .env, restart the app.",
+        ),
+        _ => (
+            "AUTHENTICATION REQUIRED FOR EQUITY DATA",
+            "Set both APCA_API_KEY_ID and APCA_API_SECRET_KEY in .env or the system environment.\n\
+             Restart the app after changing .env.",
+        ),
+    }
+}
+
 pub fn render_market_pulse_card(frame: &mut Frame, app: &App, area: Rect, active: bool) {
     let btc_q = app.market.quotes.get("BINANCE:BTCUSDT");
     let eth_q = app.market.quotes.get("BINANCE:ETHUSDT");
@@ -3166,8 +4256,9 @@ pub fn render_market_pulse_card(frame: &mut Frame, app: &App, area: Rect, active
     let status_desc = match app.market.chart_status {
         ChartDataStatus::AuthenticationRequired => {
             format!(
-                "Chart for {}: Set APCA_API_KEY_ID in :SETTINGS for live equity candles",
-                app.asset.key()
+                "Chart for {}: {}",
+                app.asset.key(),
+                equity_auth_diagnostic(app).0
             )
         }
         ChartDataStatus::Error => {
@@ -3388,17 +4479,16 @@ impl Widget for CandleChart<'_> {
         if app.market.candles.is_empty() {
             let msg = match app.market.chart_status {
                 ChartDataStatus::AuthenticationRequired => {
+                    let (title, guidance) = equity_auth_diagnostic(app);
                     format!(
-                        "AUTHENTICATION REQUIRED FOR EQUITY DATA\n\n\
-                         {} historical candles unavailable — configure required Alpaca IEX credentials.\n\n\
-                         Instructions:\n\
-                         • Set APCA_API_KEY_ID in :SETTINGS or system environment\n\
-                         • Set APCA_API_SECRET_KEY for Alpaca IEX data feed\n\n\
+                        "{title}\n\n\
+                         {} historical candles unavailable.\n\n\
+                         {guidance}\n\n\
                          Alternative Feeds:\n\
                          • Run :CHART BTCUSDT (Binance Spot public discovery)\n\
                          • Run :CHART COINBASE:BTC-USD (Coinbase public exchange)\n\
                          • Run :FIN {} (SEC EDGAR public XBRL fundamentals)\n\n\
-                         Press 'R' to retry after setting credentials.",
+                         Press 'R' to retry the current credentials.",
                         app.asset.key(),
                         app.asset.symbol
                     )

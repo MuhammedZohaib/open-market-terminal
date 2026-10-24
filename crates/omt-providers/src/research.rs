@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use omt_core::{
     Company, Filing, FinancialFact, MacroObservation, NewsCategory, NewsItem, clean_html_to_text,
-    extract_article_content, summarize_sec_filing_document,
+    extract_article_content_with_headline, summarize_sec_filing_document,
 };
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
@@ -830,14 +830,19 @@ pub async fn fetch_news(
             ));
         }
     }
-    let mut all = Vec::new();
-    for (src, url, cat, def_ticker) in feeds {
-        if let Ok(xml) = http.text(&url).await
-            && let Ok(parsed) = parse_rss_or_atom(&xml, src, cat, def_ticker.as_deref())
-        {
-            all.extend(parsed);
-        }
-    }
+    // Fixed small source list: fetch independent publishers concurrently.
+    let requests = feeds
+        .into_iter()
+        .map(|(src, url, cat, def_ticker)| async move {
+            match http.text(&url).await {
+                Ok(xml) => {
+                    parse_rss_or_atom(&xml, src, cat, def_ticker.as_deref()).unwrap_or_default()
+                }
+                Err(_) => Vec::new(),
+            }
+        });
+    let fetched = futures_util::future::join_all(requests).await;
+    let all: Vec<_> = fetched.into_iter().flatten().collect();
     if all.is_empty() {
         bail!("No news feeds reachable; displaying cached headlines and SEC filings");
     }
@@ -849,6 +854,7 @@ pub async fn fetch_article_or_filing_body(
     url: &str,
     is_sec_filing: bool,
     form: Option<&str>,
+    headline: Option<&str>,
     description: &str,
 ) -> Result<String> {
     if !url.starts_with("https://") {
@@ -905,7 +911,7 @@ pub async fn fetch_article_or_filing_body(
             &raw,
         ));
     }
-    let extracted = extract_article_content(&raw, url);
+    let extracted = extract_article_content_with_headline(&raw, url, headline);
     if extracted.is_excerpt
         && extracted
             .body

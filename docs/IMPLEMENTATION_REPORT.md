@@ -1,5 +1,29 @@
 # Implementation Report
 
+## Event research upgrade — 2026-10-24
+
+Added IMPACT (8/F9), benchmark comparisons, return correlation/beta, normalized
+charts, conservative daily event windows, NEWS-to-study navigation, and cached
+offline studies. Added persistent local price alerts (fresh quotes only), full
+screener presets with legacy compatibility, and masked runtime credential status.
+No dependencies were added for this upgrade.
+
+Provider fixes distinguish Alpaca authentication/subscription from actual trade
+receipt, maintain quiet sockets with ping/pong, reject blank credentials, and
+request an explicit historical range (including older-history end bounds).
+Independent RSS sources are fetched concurrently. Fixed the NEWS reader double toggle.
+
+Validation: 70 workspace tests passed, including synthetic analytics/alert cases,
+a local mock Alpaca WebSocket, and IMPACT rendering at 160x50, 100x30, and 40x12.
+Live headless checks loaded 998 paired ETH/BTC return intervals and 499 AAPL/SPY
+intervals using configured providers. The crypto study reloaded successfully
+offline. Optimized release build succeeded. These checks do not establish
+production certification or complete provider/news coverage.
+
+See [IMPACT methodology and limitations](IMPACT.md). This is daily descriptive
+analysis, not causal attribution; raw IEX prices, corporate actions, unsynchronized
+calendars, incomplete news coverage, and absence of consensus estimates remain limits.
+
 ## Summary
 
 Open Market Terminal (`omt`) is a native, local-first financial research terminal

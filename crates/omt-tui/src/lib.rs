@@ -133,6 +133,15 @@ impl ScanMode {
 }
 
 pub struct App {
+    pub alerts: Vec<omt_core::alerts::PriceAlert>,
+    pub alerts_open: bool,
+    pub impact: Option<omt_core::impact::ImpactData>,
+    pub impact_pair: Option<(AssetId, AssetId)>,
+    pub impact_status: String,
+    pub impact_event: Option<chrono::NaiveDate>,
+    pub impact_origin: Option<NewsItem>,
+    pub impact_plot_mode: usize,
+    pub fin_chart_expanded: bool,
     pub account: String,
     pub name: String,
     pub workspace: Workspace,
@@ -211,6 +220,15 @@ impl Default for App {
         let default_crypto: AssetId = "BTCUSDT".parse().unwrap();
         let default_equity: AssetId = "AAPL".parse().unwrap();
         Self {
+            alerts: Vec::new(),
+            alerts_open: false,
+            impact: None,
+            impact_pair: None,
+            impact_status: "Enter IMPACT AAPL SPY or IMPACT BINANCE:ETHUSDT BINANCE:BTCUSDT".into(),
+            impact_event: None,
+            impact_origin: None,
+            impact_plot_mode: 0,
+            fin_chart_expanded: false,
             account: "default".into(),
             name: "Open Market Terminal".into(),
             workspace: Workspace::Market,
@@ -537,6 +555,27 @@ impl App {
             }
             return None;
         }
+        if self.alerts_open && self.input.is_none() {
+            if key.code == KeyCode::Esc {
+                self.alerts_open = false;
+                self.cursor = 0;
+                return None;
+            }
+            if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
+                self.cursor = self
+                    .cursor
+                    .saturating_add(1)
+                    .min(self.alerts.len().saturating_sub(1));
+                return None;
+            }
+            if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
+                self.cursor = self.cursor.saturating_sub(1);
+                return None;
+            }
+            if matches!(key.code, KeyCode::Char(':') | KeyCode::Char('/')) {
+                self.alerts_open = false;
+            }
+        }
         if self.help || self.settings {
             if matches!(
                 key.code,
@@ -570,7 +609,7 @@ impl App {
                     "Diagnostics overlay hidden".into()
                 };
             }
-            KeyCode::Char(c @ '1'..='7') => {
+            KeyCode::Char(c @ '1'..='8') => {
                 let target = Workspace::ALL[c as usize - '1' as usize];
                 if target != self.workspace {
                     self.workspace_history
@@ -581,7 +620,7 @@ impl App {
                 self.workspace = target;
                 return Some(self.workspace.name().into());
             }
-            KeyCode::F(n @ 2..=8) => {
+            KeyCode::F(n @ 2..=9) => {
                 let target = Workspace::ALL[(n - 2) as usize];
                 if target != self.workspace {
                     self.workspace_history
@@ -806,18 +845,56 @@ impl App {
                     return Some(format!("CHART {key}"));
                 }
             }
-            KeyCode::Char('o') if matches!(self.workspace, Workspace::News | Workspace::Fin) => {
+            KeyCode::Char('e') if self.workspace == Workspace::News => return Some("STUDY".into()),
+            KeyCode::Char('e') if self.workspace == Workspace::Impact => {
+                if self.impact_event.is_some() {
+                    return Some("EVENT CLEAR".into());
+                } else if let Some(ref data) = self.impact {
+                    let cursor = self.cursor.min(data.news.len().saturating_sub(1));
+                    if let Some(news) = data.news.get(cursor) {
+                        let date = news.published_at.date_naive();
+                        return Some(format!("EVENT {}", date.format("%Y-%m-%d")));
+                    }
+                }
+                return Some("EVENT".into());
+            }
+            KeyCode::Char('o')
+                if matches!(
+                    self.workspace,
+                    Workspace::News | Workspace::Fin | Workspace::Impact
+                ) =>
+            {
                 return Some("OPEN".into());
             }
+            KeyCode::Char('p') | KeyCode::Char('P') if self.workspace == Workspace::Impact => {
+                self.impact_plot_mode = (self.impact_plot_mode + 1) % 4;
+                let mode_desc = match self.impact_plot_mode {
+                    0 => "Relative Performance (Normalized base=100 from first common close)",
+                    1 => "Event Window Trajectory (t-2 to t+5 re-indexed to baseline=100)",
+                    2 => "Cumulative Abnormal Return / CAR (excess percentage points)",
+                    _ => "Daily Return Spread (Asset return % minus Benchmark return %)",
+                };
+                self.message = format!("IMPACT Visualization Mode: {mode_desc}");
+                return None;
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') if self.workspace == Workspace::Fin => {
+                self.fin_chart_expanded = !self.fin_chart_expanded;
+                self.message = if self.fin_chart_expanded {
+                    "FIN Trends: Visual Multi-Period Income & Revenue Chart active (press 'p' for tables)".into()
+                } else {
+                    "FIN Statements: Multi-period comparative tables active (press 'p' for charts)"
+                        .into()
+                };
+                return None;
+            }
             KeyCode::Char('r') if self.workspace == Workspace::News => {
-                self.news_reader_expanded = !self.news_reader_expanded;
                 self.mark_selected_news_read();
                 return Some("READ".into());
             }
             KeyCode::Char('R')
                 if matches!(
                     self.workspace,
-                    Workspace::News | Workspace::Chart | Workspace::Fin
+                    Workspace::News | Workspace::Chart | Workspace::Fin | Workspace::Impact
                 ) =>
             {
                 return Some("REFRESH".into());
@@ -1236,6 +1313,7 @@ fn shortcut_keycaps_for_workspace(workspace: Workspace) -> Vec<(&'static str, &'
             ("/", "Search"),
             (":", "GO>"),
             ("Tab", "Focus"),
+            ("p", "Plot Trends"),
             ("a", "Annual"),
             ("v", "Quarterly"),
             ("s/[/]", "StmtTab"),
@@ -1282,6 +1360,17 @@ fn shortcut_keycaps_for_workspace(workspace: Workspace) -> Vec<(&'static str, &'
             ("Enter", "Chart"),
             (":BUY/:SELL", "Orders"),
             (":ACCOUNT", "Acct"),
+            ("L", "Layout"),
+            ("F1", "Help"),
+        ],
+        Workspace::Impact => vec![
+            ("j/k", "Event"),
+            ("e", "Pin/Follow"),
+            ("p", "Plot Mode"),
+            ("o", "Source"),
+            ("R", "Refresh"),
+            (":IMPACT", "Pair"),
+            (":EVENT", "Date"),
             ("L", "Layout"),
             ("F1", "Help"),
         ],
@@ -1619,6 +1708,7 @@ fn workspace_provider_summary(app: &App) -> (&'static str, String, Color) {
             format!("Acct: {} ({} tx)", app.account, app.transactions.len()),
             POSITIVE,
         ),
+        Workspace::Impact => ("Daily event study", app.impact_status.clone(), SECONDARY),
         Workspace::Econ => {
             let src = app
                 .macro_data
@@ -2022,10 +2112,39 @@ fn render_inner(frame: &mut Frame, app: &App) {
             popup,
         );
     }
+    if app.alerts_open {
+        views::alerts(frame, app, area);
+    }
     if app.help || app.settings {
         let popup = Rect::new(area.x + 2, area.y + 2, area.width - 4, area.height - 4);
         frame.render_widget(Clear, popup);
-        let text = if app.settings { SETTINGS_TEXT } else { HELP };
+        let text = if app.settings {
+            let present = |name: &str| {
+                if std::env::var(name)
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty())
+                {
+                    "present"
+                } else {
+                    "missing"
+                }
+            };
+            format!(
+                "Runtime credentials (values hidden; presence does not validate access):\nAPCA key: {} | secret: {} | FRED: {}\n{}\n\n{}",
+                present("APCA_API_KEY_ID"),
+                present("APCA_API_SECRET_KEY"),
+                present("FRED_API_KEY"),
+                app.market
+                    .venue_status
+                    .iter()
+                    .map(|(p, s)| format!("{p}: {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                SETTINGS_TEXT
+            )
+        } else {
+            HELP.to_owned()
+        };
         let title = if app.settings {
             " Workstation Settings & Provider Configuration (Esc to close) "
         } else {
@@ -2050,6 +2169,7 @@ fn render_workspace_pane(frame: &mut Frame, app: &App, workspace: Workspace, are
         Workspace::News => views::news(frame, app, area),
         Workspace::Port => views::portfolio(frame, app, area),
         Workspace::Econ => views::economics(frame, app, area),
+        Workspace::Impact => views::impact(frame, app, area),
     }
 }
 
@@ -2062,6 +2182,7 @@ fn render_secondary_panel(frame: &mut Frame, app: &App, area: Rect) {
         Workspace::Scan => Workspace::Chart,
         Workspace::Port => Workspace::Chart,
         Workspace::Econ => Workspace::Chart,
+        Workspace::Impact => Workspace::News,
     };
     render_workspace_pane(frame, app, companion, area);
 }
@@ -2215,8 +2336,15 @@ fn context(frame: &mut Frame, app: &App, area: Rect) {
         )
     } else {
         format!(
-            "{}\n\nNo live quote in cache.\n\nActive Providers:\n• Binance Spot: Public exchange-wide discovery & !miniTicker@arr stream\n• SEC EDGAR: Public XBRL company facts & regulatory filings\n• US Treasury / World Bank: Public macro & yield curves\n• Coinbase Exchange: Public crypto pairs\n• Alpaca IEX: Optional (configure in :SETTINGS)\n\n{}",
-            inspect_key, app.research_status
+            "{}\n\nNo live quote in cache.\nFeed: {}\nHistorical bars are separate from live trades. A subscribed market may be quiet.\n\nActive Providers:\n• Binance Spot: Public exchange-wide discovery & !miniTicker@arr stream\n• SEC EDGAR: Public XBRL company facts & regulatory filings\n• US Treasury / World Bank: Public macro & yield curves\n• Coinbase Exchange: Public crypto pairs\n• Alpaca IEX: Credentials in .env; status in SETTINGS\n\n{}",
+            inspect_key,
+            inspect_key
+                .parse::<AssetId>()
+                .ok()
+                .and_then(|a| app.market.venue_status.get(&a.venue.to_string()))
+                .map(String::as_str)
+                .unwrap_or("No connection status available"),
+            app.research_status
         )
     };
     frame.render_widget(
@@ -2247,7 +2375,11 @@ pub const SETTINGS_TEXT: &str = "Workstation & Data Provider Configuration\n\n\
 
 pub const HELP: &str = "Keyboard Navigation & Controls\n\
 / or : or Ctrl+P  Open GO> command bar (Tab autocompletes, Up/Down cycles history)\n\
-1-7 or F2-F8      Switch workspaces: 1:MARKET[MKT] 2:CHART[GP] 3:FIN[FA] 4:NEWS[CN] 5:SCAN[EQS] 6:PORT[PRTU] 7:ECON[ECST]\n\
+IMPACT AAPL SPY    Event windows, normalized prices, return correlation and beta\n\
+EVENT YYYY-MM-DD  Choose event date; EVENT CLEAR follows headlines\n\
+e (NEWS)          Study selected headline date and source\n\
+ALERT ADD AAPL ABOVE 250 / ALERT LIST / ALERT REMOVE 1\n\
+1-8 or F2-F9      Switch workspaces: 1:MARKET[MKT] 2:CHART[GP] 3:FIN[FA] 4:NEWS[CN] 5:SCAN[EQS] 6:PORT[PRTU] 7:ECON[ECST] 8:IMPACT[EVT]\n\
 Tab / Shift+Tab   Cycle panel focus (Watchlist / Central Workspace / Context Inspector)\n\
 Up/Down or j/k    Move row selection (PgUp/PgDn/Home/End for fast table navigation)\n\
 Enter             Open row in CHART / read article in NEWS / open filing in browser\n\
@@ -2283,6 +2415,128 @@ ACCOUNT <NAME>   IMPORT <CSV>   EXPORT <CSV>   TREASURY/YCRV   WB <CTRY> <SERIES
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn impact_study_render_and_navigation() {
+        let at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let bars: Vec<_> = (0..60)
+            .map(|i| {
+                let p = Decimal::from(100 + i + i % 3);
+                omt_core::Candle {
+                    open_at: at + chrono::Duration::days(i),
+                    open: p,
+                    high: p,
+                    low: p,
+                    close: p,
+                    volume: 10.into(),
+                    closed: true,
+                }
+            })
+            .collect();
+        let news = NewsItem {
+            id: "fixture".into(),
+            published_at: at + chrono::Duration::days(30),
+            fetched_at: at,
+            source: "TEST FIXTURE".into(),
+            ticker: Some("AAPL".into()),
+            category: NewsCategory::Equities,
+            headline: "Synthetic event for renderer test".into(),
+            summary: String::new(),
+            body: None,
+            url: "https://example.com/fixture".into(),
+            is_sec_filing: false,
+            form: None,
+            accession: None,
+            report_date: None,
+        };
+        let mut app = App {
+            workspace: Workspace::Impact,
+            full_width: true,
+            impact: Some(omt_core::impact::ImpactData {
+                asset: "AAPL".parse().unwrap(),
+                benchmark: "SPY".parse().unwrap(),
+                prices: bars.clone(),
+                benchmark_prices: bars,
+                news: vec![news],
+                fetched_at: at + chrono::Duration::days(65),
+                warnings: vec![],
+            }),
+            ..Default::default()
+        };
+        for (w, h) in [(160, 50), (100, 30), (40, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| render(f, &app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains("IMPACT"));
+            if w == 160 {
+                assert!(text.contains("Correlation +1.00"));
+                assert!(text.contains("Relative performance"));
+                assert!(text.contains("Excess (pp)"));
+            }
+        }
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            Some("OPEN".into())
+        );
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            Some("EVENT 2026-01-31".into())
+        );
+        app.impact_event = Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap());
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            Some("EVENT CLEAR".into())
+        );
+        app.impact_event = None;
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE)),
+            Some("REFRESH".into())
+        );
+        // Test Plot on demand ('p') cycling across financial visualization modes
+        assert_eq!(app.impact_plot_mode, 0);
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.impact_plot_mode, 1);
+        let mut term_react = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        term_react.draw(|f| render(f, &app)).unwrap();
+        let react_text: String = term_react
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            react_text.contains("Event Reaction Window")
+                || react_text.contains("Relative performance")
+        );
+
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.impact_plot_mode, 2);
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.impact_plot_mode, 3);
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app.impact_plot_mode, 0);
+
+        // Test FIN plot on demand toggle
+        app.workspace = Workspace::Fin;
+        assert!(!app.fin_chart_expanded);
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(app.fin_chart_expanded);
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(!app.fin_chart_expanded);
+        app.workspace = Workspace::Impact;
+
+        app.alerts_open = true;
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.alerts_open);
+    }
     #[test]
     fn navigation_and_completion() {
         let mut app = App::default();
@@ -2735,8 +2989,12 @@ mod tests {
         assert_eq!(aapl_news[0].id, "item-1");
 
         // Test expanded reader view ('r')
-        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert!(app.news_reader_expanded);
+        assert_eq!(
+            app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Some("READ".into())
+        );
+        assert!(!app.news_reader_expanded); // Controller owns the single toggle.
+        app.news_reader_expanded = true;
         t.draw(|f| render(f, &app)).unwrap();
         let text_reader: String = t
             .backend()
@@ -3000,6 +3258,31 @@ mod tests {
             .collect();
         assert!(text_auth.contains("AUTHENTICATION REQUIRED"));
         assert!(text_auth.contains("APCA_API_KEY_ID"));
+
+        // Configured credentials rejected by the provider must not look missing.
+        for (error, expected) in [
+            (
+                "Provider HTTP 401 Unauthorized",
+                "ALPACA REJECTED CREDENTIALS (HTTP 401)",
+            ),
+            (
+                "Provider HTTP 403 Forbidden",
+                "ALPACA DATA ACCESS DENIED (HTTP 403)",
+            ),
+        ] {
+            app.market.chart_error = Some(error.into());
+            t.draw(|f| render(f, &app)).unwrap();
+            let text: String = t
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains(expected));
+            assert!(!text.contains("AUTHENTICATION REQUIRED FOR EQUITY DATA"));
+        }
+        app.market.chart_error = None;
 
         // 2. Loading
         app.market.chart_status = ChartDataStatus::Loading;

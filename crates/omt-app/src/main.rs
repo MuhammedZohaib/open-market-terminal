@@ -88,6 +88,7 @@ impl Drop for TerminalGuard {
     }
 }
 enum ResearchResult {
+    Impact(Result<omt_core::impact::ImpactData>, AssetId, AssetId),
     Company(Result<Company>, String),
     Macro(Result<Vec<MacroObservation>>, String),
     Catalog(Vec<String>),
@@ -105,6 +106,35 @@ async fn researcher(
     let mut mapping = None;
     while let Some(request) = requests.recv().await {
         let result = match request {
+            ResearchRequest::Impact(asset, benchmark) => {
+                let result = async {
+                    let (prices, benchmark_prices, news) = tokio::join!(
+                        market::history(&http, &asset, Timeframe::D1),
+                        market::history(&http, &benchmark, Timeframe::D1),
+                        research::fetch_news(&http, Some(asset.symbol.as_str()), NewsCategory::All)
+                    );
+                    let mut warnings = Vec::new();
+                    let news = match news {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            warnings.push(format!("News unavailable: {e}"));
+                            Vec::new()
+                        }
+                    };
+                    Ok(omt_core::impact::ImpactData {
+                        prices: prices.context("Subject history")?,
+                        benchmark_prices: benchmark_prices.context("Benchmark history")?,
+                        asset: asset.clone(),
+                        benchmark: benchmark.clone(),
+                        news,
+                        fetched_at: chrono::Utc::now(),
+                        warnings,
+                    })
+                }
+                .await;
+                ResearchResult::Impact(result, asset, benchmark)
+            }
+
             ResearchRequest::Company(ticker) => {
                 let result = async {
                     let sec = sec.as_ref().context(
@@ -142,6 +172,7 @@ async fn researcher(
                     &item.url,
                     item.is_sec_filing,
                     item.form.as_deref(),
+                    Some(&item.headline),
                     &item.summary,
                 )
                 .await;
@@ -164,6 +195,41 @@ fn apply_research(
     request_tx: &mpsc::Sender<ResearchRequest>,
 ) -> Result<()> {
     match event {
+        ResearchResult::Impact(result, asset, benchmark) => {
+            let current = c.app.impact_pair.as_ref() == Some(&(asset.clone(), benchmark.clone()));
+            match result {
+                Ok(mut data) => {
+                    data.news.extend(
+                        c.app
+                            .news_items
+                            .iter()
+                            .filter(|n| {
+                                n.ticker
+                                    .as_deref()
+                                    .is_some_and(|t| t.eq_ignore_ascii_case(&asset.symbol))
+                            })
+                            .cloned(),
+                    );
+                    data.news = research::dedup_news(data.news);
+                    data.news.truncate(100);
+                    c.store.put(
+                        "impact",
+                        &format!("{}|{}", asset.key(), benchmark.key()),
+                        &data,
+                    )?;
+                    if current {
+                        c.app.impact_status =
+                            format!("Fetched {} UTC", data.fetched_at.format("%Y-%m-%d %H:%M"));
+                        c.app.impact = Some(data);
+                    }
+                }
+                Err(e) if current => {
+                    c.app.impact_status =
+                        format!("Study fetch failed: {e:#}; previous cache retained if available")
+                }
+                Err(_) => {}
+            }
+        }
         ResearchResult::Company(result, ticker) => match result {
             Ok(company) => {
                 let filing_news = omt_core::company_filings_to_news(&company);
@@ -300,12 +366,27 @@ fn apply_market(app: &mut App, mut market: omt_data::MarketState) {
         market.chart_key = key;
     }
     let had_selection = app.selected_market_key.is_some();
+    for alert in &mut app.alerts {
+        if let Some(quote) = market.quotes.get(&alert.asset.key())
+            && alert.evaluate(quote, chrono::Utc::now())
+        {
+            app.message = format!(
+                "ALERT #{} {} {} at {} {}",
+                alert.id,
+                alert.asset.key(),
+                if alert.above { "ABOVE" } else { "BELOW" },
+                quote.price,
+                quote.currency
+            );
+        }
+    }
     app.market = market;
     if !had_selection && (!app.market.quotes.is_empty() || !app.market.instruments.is_empty()) {
         app.sync_market_selection();
     }
 }
 fn save(c: &Controller) -> Result<()> {
+    c.store.put("alerts", "rules", &c.app.alerts)?;
     for asset in &c.app.watchlist {
         if let Some(q) = c.app.market.quotes.get(&asset.key()) {
             c.store.put_at("quote", &q.asset.key(), q, q.received_at)?;
@@ -346,8 +427,22 @@ fn save(c: &Controller) -> Result<()> {
     )?;
     Ok(())
 }
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Load local defaults before the runtime starts threads. Existing environment
+    // variables take precedence, and a missing .env is valid for installed apps.
+    match dotenvy::dotenv() {
+        Ok(_) => {}
+        Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Parser errors can contain credential values; do not include them here.
+        Err(_) => anyhow::bail!("Cannot load .env; check its permissions and KEY=value syntax"),
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let started = Instant::now();
     let args = Args::parse();
     let dirs = directories::ProjectDirs::from("org", "OpenMarketTerminal", "omt")
@@ -400,6 +495,10 @@ async fn main() -> Result<()> {
         companies: store.companies()?,
         ..Default::default()
     };
+    app.alerts = store
+        .get::<Vec<omt_core::alerts::PriceAlert>>("alerts", "rules")?
+        .map(|v| v.0)
+        .unwrap_or_default();
     if let Some((cached_news, _)) = store.get::<Vec<NewsItem>>("news", "recent")? {
         app.news_items = cached_news;
     }
