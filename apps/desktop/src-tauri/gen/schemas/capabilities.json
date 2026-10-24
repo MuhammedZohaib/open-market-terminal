@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default permissions for Open Market Terminal desktop window","local":true,"windows":["main"],"permissions":["core:default","opener:default","window-state:default"]}}

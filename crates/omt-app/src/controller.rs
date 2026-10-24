@@ -116,11 +116,12 @@ impl Controller {
                     self.app.market_mode = MarketMode::Overview;
                 }
                 if let Some(raw_asset) = asset.clone() {
-                    let resolved = if matches!(workspace, Workspace::Fin | Workspace::News) {
-                        raw_asset
-                    } else {
-                        self.resolve_known_asset(raw_asset)
-                    };
+                    let resolved =
+                        if matches!(workspace, Workspace::Fin | Workspace::News | Workspace::Des) {
+                            raw_asset
+                        } else {
+                            self.resolve_known_asset(raw_asset)
+                        };
                     if resolved != self.app.asset {
                         self.app.company = None;
                         self.app.cursor = 0;
@@ -164,9 +165,22 @@ impl Controller {
                 }
                 if workspace == Workspace::Fin {
                     if self.app.asset.venue != Venue::Iex {
-                        self.app.research_status =
-                            "SEC financials require a US company symbol, e.g. FIN AAPL".into();
+                        if self.app.last_equity_asset.venue == Venue::Iex {
+                            let eq = self.app.last_equity_asset.clone();
+                            self.app.set_active_asset(eq.clone());
+                            research = self.company(&eq.symbol)?;
+                            self.app.message =
+                                format!("Switched to last active equity: {}", eq.symbol);
+                        } else {
+                            self.app.research_status =
+                                "SEC financials require a US company symbol, e.g. FIN AAPL".into();
+                        }
                     } else {
+                        research = self.company(&self.app.asset.symbol.clone())?;
+                    }
+                } else if workspace == Workspace::Des {
+                    self.app.des_mode = true;
+                    if self.app.asset.venue == Venue::Iex {
                         research = self.company(&self.app.asset.symbol.clone())?;
                     }
                 } else if workspace == Workspace::News {
@@ -187,18 +201,29 @@ impl Controller {
                 if workspace == Workspace::Econ && self.app.macro_data.is_empty() {
                     research = self.macro_request("TREASURY".into(), ResearchRequest::Treasury)?;
                 }
+                if workspace == Workspace::Des {
+                    self.app.des_mode = true;
+                    if self.app.asset.venue == Venue::Iex {
+                        research = self.company(&self.app.asset.symbol.clone())?;
+                    }
+                }
             }
             Command::Help => self.app.help = true,
             Command::Settings => self.app.settings = true,
             Command::Watch(add, raw_asset) => {
                 let asset = self.resolve_known_asset(raw_asset);
-                if add && self.app.watchlist.len() >= 40 {
-                    bail!("Watchlist limit is 40 assets to bound detailed subscriptions");
+                if add && self.app.worksheet.symbols.len() >= 50 {
+                    bail!("Worksheet limit is 50 assets to bound real-time feeds");
                 }
-                self.store.watch(&self.app.list_name, &asset, add)?;
-                self.app.watchlist = self.store.watchlist(&self.app.list_name)?;
+                if add {
+                    self.app.worksheet.add(asset.clone());
+                } else {
+                    self.app.worksheet.remove(&asset);
+                }
+                self.store.save_worksheet(&self.app.worksheet)?;
+                self.app.watchlist = self.app.worksheet.symbols.clone();
                 self.app.message = format!(
-                    "{} {} in watchlist '{}'",
+                    "{} {} in worksheet '{}'",
                     if add { "Added" } else { "Removed" },
                     asset.key(),
                     self.app.list_name
@@ -208,11 +233,138 @@ impl Controller {
                 if name.len() > 64 {
                     bail!("Watchlist name is too long");
                 }
-                self.store.ensure_watchlist(&name)?;
-                self.app.list_name = name;
-                self.app.watchlist = self.store.watchlist(&self.app.list_name)?;
+                let ws = self.store.load_worksheet(&name)?.unwrap_or_else(|| {
+                    let ws = omt_core::Worksheet::new(&name);
+                    let _ = self.store.save_worksheet(&ws);
+                    ws
+                });
+                self.app.list_name = ws.name.clone();
+                self.app.watchlist = ws.symbols.clone();
+                self.app.worksheet = ws;
                 self.app.watch_cursor = 0;
+                self.app.cursor = 0;
+                self.app.workspace = Workspace::Market;
+                self.app.market_mode = MarketMode::Worksheet;
+                self.app.message = format!("Switched to worksheet '{}'", name);
             }
+            Command::Worksheet(action) => match action {
+                omt_core::command::WorksheetAction::Open(name_opt) => {
+                    let target = name_opt.as_deref().unwrap_or(&self.app.list_name);
+                    let ws = match self.store.load_worksheet(target)? {
+                        Some(ws) => ws,
+                        None => {
+                            let ws = omt_core::Worksheet::new(target);
+                            self.store.save_worksheet(&ws)?;
+                            ws
+                        }
+                    };
+                    self.app.list_name = ws.name.clone();
+                    self.app.watchlist = ws.symbols.clone();
+                    self.app.worksheet = ws;
+                    self.app.watch_cursor = 0;
+                    self.app.cursor = 0;
+                    self.app.workspace = Workspace::Market;
+                    self.app.market_mode = MarketMode::Worksheet;
+                    self.app.message = format!(
+                        "Loaded worksheet '{}' ({} securities)",
+                        self.app.list_name,
+                        self.app.worksheet.symbols.len()
+                    );
+                }
+                omt_core::command::WorksheetAction::Create(name) => {
+                    if name.is_empty() || name.len() > 32 {
+                        bail!("Worksheet name must be 1 to 32 characters");
+                    }
+                    let ws = omt_core::Worksheet::new(&name);
+                    self.store.save_worksheet(&ws)?;
+                    self.app.list_name = ws.name.clone();
+                    self.app.watchlist = ws.symbols.clone();
+                    self.app.worksheet = ws;
+                    self.app.watch_cursor = 0;
+                    self.app.cursor = 0;
+                    self.app.workspace = Workspace::Market;
+                    self.app.market_mode = MarketMode::Worksheet;
+                    self.app.message = format!("Created worksheet '{}'", name);
+                }
+                omt_core::command::WorksheetAction::Delete(name) => {
+                    let deleted = self.store.delete_worksheet(&name)?;
+                    if deleted {
+                        if self.app.list_name == name {
+                            let fallback = self
+                                .store
+                                .load_worksheet("DEFAULT")?
+                                .unwrap_or_else(|| omt_core::Worksheet::new("DEFAULT"));
+                            self.app.list_name = fallback.name.clone();
+                            self.app.watchlist = fallback.symbols.clone();
+                            self.app.worksheet = fallback;
+                        }
+                        self.app.message = format!("Deleted worksheet '{}'", name);
+                    } else {
+                        self.app.message = format!("Worksheet '{}' not found", name);
+                    }
+                }
+                omt_core::command::WorksheetAction::Add(raw_asset) => {
+                    let asset = self.resolve_known_asset(raw_asset);
+                    if self.app.worksheet.symbols.len() >= 50 {
+                        bail!("Worksheet limit is 50 assets to bound real-time feeds");
+                    }
+                    let added = self.app.worksheet.add(asset.clone());
+                    if added {
+                        self.store.save_worksheet(&self.app.worksheet)?;
+                        self.app.watchlist = self.app.worksheet.symbols.clone();
+                        self.app.message = format!(
+                            "Added {} to worksheet '{}'",
+                            asset.symbol, self.app.list_name
+                        );
+                    } else {
+                        self.app.message = format!(
+                            "{} is already in worksheet '{}'",
+                            asset.symbol, self.app.list_name
+                        );
+                    }
+                }
+                omt_core::command::WorksheetAction::Remove(raw_asset) => {
+                    let asset = self.resolve_known_asset(raw_asset);
+                    let removed = self.app.worksheet.remove(&asset);
+                    if removed {
+                        self.store.save_worksheet(&self.app.worksheet)?;
+                        self.app.watchlist = self.app.worksheet.symbols.clone();
+                        if self.app.cursor >= self.app.worksheet.symbols.len() {
+                            self.app.cursor = self.app.worksheet.symbols.len().saturating_sub(1);
+                        }
+                        self.app.message = format!(
+                            "Removed {} from worksheet '{}'",
+                            asset.symbol, self.app.list_name
+                        );
+                    } else {
+                        self.app.message = format!(
+                            "{} not found in worksheet '{}'",
+                            asset.symbol, self.app.list_name
+                        );
+                    }
+                }
+                omt_core::command::WorksheetAction::Columns(cols) => {
+                    self.app.worksheet.columns = cols;
+                    self.store.save_worksheet(&self.app.worksheet)?;
+                    self.app.message = format!(
+                        "Updated columns for worksheet '{}' ({} columns)",
+                        self.app.list_name,
+                        self.app.worksheet.columns.len()
+                    );
+                }
+                omt_core::command::WorksheetAction::Reset => {
+                    self.app.worksheet.columns = omt_core::WorksheetColumn::default_columns();
+                    self.store.save_worksheet(&self.app.worksheet)?;
+                    self.app.message = format!(
+                        "Reset columns for worksheet '{}' to default",
+                        self.app.list_name
+                    );
+                }
+                omt_core::command::WorksheetAction::List => {
+                    let list = self.store.list_worksheets()?;
+                    self.app.message = format!("Worksheets ({}): {}", list.len(), list.join(", "));
+                }
+            },
             Command::Raw(parts) => {
                 let head = parts[0].to_ascii_uppercase();
                 match head.as_str() {
@@ -1047,15 +1199,48 @@ impl Controller {
                                 self.app.set_active_asset(resolved);
                             }
                         }
+                        self.app.workspace = Workspace::Des;
                         self.app.des_mode = true;
                         if self.app.asset.venue == Venue::Iex {
-                            self.app.workspace = Workspace::Fin;
                             research = self.company(&self.app.asset.symbol.clone())?;
-                        } else {
-                            self.app.workspace = Workspace::Chart;
                         }
                         self.app.message =
                             format!("Security Description <DES> — {}", self.app.asset.key());
+                    }
+                    "LINK" => {
+                        let sub = parts.get(1).map(|s| s.to_ascii_uppercase());
+                        match sub.as_deref() {
+                            Some("A") => {
+                                self.app.link_group = omt_core::LinkGroup::A;
+                                if self.app.layout_mode == LayoutMode::Quad {
+                                    self.app.quad_link_groups[self.app.quad_focus] =
+                                        omt_core::LinkGroup::A;
+                                }
+                            }
+                            Some("B") => {
+                                self.app.link_group = omt_core::LinkGroup::B;
+                                if self.app.layout_mode == LayoutMode::Quad {
+                                    self.app.quad_link_groups[self.app.quad_focus] =
+                                        omt_core::LinkGroup::B;
+                                }
+                            }
+                            Some("NONE") | Some("CLEAR") | Some("--") => {
+                                self.app.link_group = omt_core::LinkGroup::None;
+                                if self.app.layout_mode == LayoutMode::Quad {
+                                    self.app.quad_link_groups[self.app.quad_focus] =
+                                        omt_core::LinkGroup::None;
+                                }
+                            }
+                            _ => {
+                                self.app.link_group = self.app.link_group.next();
+                                if self.app.layout_mode == LayoutMode::Quad {
+                                    self.app.quad_link_groups[self.app.quad_focus] =
+                                        self.app.quad_link_groups[self.app.quad_focus].next();
+                                }
+                            }
+                        }
+                        self.app.message =
+                            format!("Active Link Group: {}", self.app.link_group.label());
                     }
                     "OLDER_HISTORY" => {
                         if let Some(first_bar) = self.app.market.candles.first() {
@@ -1339,9 +1524,68 @@ mod tests {
         assert_eq!(c.app.layout_mode, LayoutMode::Standard);
         assert!(!c.app.full_width);
 
-        // Test DES command
+        // Test DES command and context inheritance spine
         c.command("DES AAPL").unwrap();
         assert!(c.app.des_mode);
+        assert_eq!(c.app.workspace, Workspace::Des);
+        assert_eq!(c.app.asset.symbol, "AAPL");
+
+        // Subsequent GP without symbol inherits AAPL
+        c.command("GP").unwrap();
+        assert_eq!(c.app.workspace, Workspace::Chart);
+        assert_eq!(c.app.asset.symbol, "AAPL");
+
+        // Subsequent FA without symbol inherits AAPL
+        c.command("FA").unwrap();
         assert_eq!(c.app.workspace, Workspace::Fin);
+        assert_eq!(c.app.asset.symbol, "AAPL");
+
+        // Subsequent CN without symbol inherits AAPL
+        c.command("CN").unwrap();
+        assert_eq!(c.app.workspace, Workspace::News);
+        assert_eq!(c.app.asset.symbol, "AAPL");
+
+        // Test LINK command
+        c.command("LINK B").unwrap();
+        assert_eq!(c.app.link_group, omt_core::LinkGroup::B);
+
+        // Test Worksheet commands
+        c.command("W CREATE TECH").unwrap();
+        assert_eq!(c.app.workspace, Workspace::Market);
+        assert_eq!(c.app.market_mode, MarketMode::Worksheet);
+        assert_eq!(c.app.list_name, "TECH");
+        assert!(c.app.worksheet.symbols.is_empty());
+
+        c.command("W ADD AAPL").unwrap();
+        assert_eq!(c.app.worksheet.symbols.len(), 1);
+        assert_eq!(c.app.worksheet.symbols[0].symbol, "AAPL");
+
+        c.command("W ADD MSFT").unwrap();
+        assert_eq!(c.app.worksheet.symbols.len(), 2);
+        assert_eq!(c.app.watchlist.len(), 2);
+
+        // Test W COL custom columns
+        c.command("W COL SYM LAST CHG% VOL").unwrap();
+        assert_eq!(c.app.worksheet.columns.len(), 4);
+        assert_eq!(
+            c.app.worksheet.columns[0],
+            omt_core::WorksheetColumn::Symbol
+        );
+
+        // Test W DEL
+        c.command("W DEL AAPL").unwrap();
+        assert_eq!(c.app.worksheet.symbols.len(), 1);
+        assert_eq!(c.app.worksheet.symbols[0].symbol, "MSFT");
+
+        // Test W RESET
+        c.command("W RESET").unwrap();
+        assert_eq!(
+            c.app.worksheet.columns,
+            omt_core::WorksheetColumn::default_columns()
+        );
+
+        // Test W LIST
+        c.command("W LIST").unwrap();
+        assert!(c.app.message.contains("TECH"));
     }
 }

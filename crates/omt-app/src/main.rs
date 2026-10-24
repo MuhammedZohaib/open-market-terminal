@@ -486,11 +486,20 @@ async fn run() -> Result<()> {
     let list = store
         .setting("watchlist")?
         .unwrap_or_else(|| "default".into());
+    let ws = store.load_worksheet(&list)?.unwrap_or_else(|| {
+        let mut ws = omt_core::Worksheet::new(&list);
+        if let Ok(items) = store.watchlist(&list) {
+            ws.symbols = items;
+        }
+        let _ = store.save_worksheet(&ws);
+        ws
+    });
     let mut app = App {
         name: config.name,
         ascii: config.ascii,
-        list_name: list.clone(),
-        watchlist: store.watchlist(&list)?,
+        list_name: ws.name.clone(),
+        watchlist: ws.symbols.clone(),
+        worksheet: ws,
         transactions: store.transactions()?,
         companies: store.companies()?,
         ..Default::default()

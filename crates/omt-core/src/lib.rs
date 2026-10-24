@@ -78,6 +78,296 @@ impl fmt::Display for Venue {
         })
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum LinkGroup {
+    #[default]
+    A,
+    B,
+    None,
+}
+
+impl LinkGroup {
+    pub const ALL: [Self; 3] = [Self::A, Self::B, Self::None];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::A => "LG: A",
+            Self::B => "LG: B",
+            Self::None => "LG: --",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::None,
+            Self::None => Self::A,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentId {
+    pub canonical_id: String,
+    pub symbol: String,
+    pub name: Option<String>,
+    pub asset_class: AssetClass,
+    pub venue: Option<String>,
+    pub currency: Option<String>,
+    pub base_asset: Option<String>,
+    pub quote_asset: Option<String>,
+    pub cik: Option<String>,
+    pub provider_ids: std::collections::HashMap<String, String>,
+}
+
+impl InstrumentId {
+    pub fn from_asset(asset: &AssetId) -> Self {
+        let mut provider_ids = std::collections::HashMap::new();
+        provider_ids.insert(asset.venue.to_string(), asset.symbol.clone());
+        Self {
+            canonical_id: format!("{}:{}", asset.venue, asset.symbol),
+            symbol: asset.symbol.clone(),
+            name: None,
+            asset_class: asset.asset_class,
+            venue: Some(asset.venue.to_string()),
+            currency: Some(asset.currency().to_string()),
+            base_asset: Some(asset.base_asset().to_string()),
+            quote_asset: if asset.asset_class == AssetClass::Crypto {
+                Some(asset.currency().to_string())
+            } else {
+                None
+            },
+            cik: None,
+            provider_ids,
+        }
+    }
+
+    pub fn to_asset(&self) -> Result<AssetId, String> {
+        self.canonical_id.parse()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentContext {
+    pub global: AssetId,
+    pub local_selection: Option<String>,
+    pub link_group: LinkGroup,
+    pub recent: Vec<AssetId>,
+}
+
+impl InstrumentContext {
+    pub fn new(global: AssetId) -> Self {
+        Self {
+            recent: vec![global.clone()],
+            global,
+            local_selection: None,
+            link_group: LinkGroup::A,
+        }
+    }
+
+    pub fn set_global(&mut self, asset: AssetId) {
+        self.recent.retain(|a| a != &asset);
+        self.recent.insert(0, asset.clone());
+        if self.recent.len() > 16 {
+            self.recent.truncate(16);
+        }
+        self.global = asset;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct ProviderCapabilities {
+    pub quotes: bool,
+    pub streaming: bool,
+    pub historical_bars: bool,
+    pub fundamentals: bool,
+    pub filings: bool,
+    pub news: bool,
+    pub macro_series: bool,
+    pub yield_curve: bool,
+}
+
+impl ProviderCapabilities {
+    pub fn binance_spot() -> Self {
+        Self {
+            quotes: true,
+            streaming: true,
+            historical_bars: true,
+            fundamentals: false,
+            filings: false,
+            news: false,
+            macro_series: false,
+            yield_curve: false,
+        }
+    }
+
+    pub fn sec_edgar() -> Self {
+        Self {
+            quotes: false,
+            streaming: false,
+            historical_bars: false,
+            fundamentals: true,
+            filings: true,
+            news: false,
+            macro_series: false,
+            yield_curve: false,
+        }
+    }
+
+    pub fn alpaca_iex() -> Self {
+        Self {
+            quotes: true,
+            streaming: true,
+            historical_bars: true,
+            fundamentals: false,
+            filings: false,
+            news: false,
+            macro_series: false,
+            yield_curve: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WorksheetColumn {
+    Symbol,
+    Last,
+    ChangePct,
+    ChangeAbs,
+    Volume,
+    QuoteVolume,
+    Bid,
+    Ask,
+    SpreadBps,
+    PeRatio,
+    MarketCap,
+    NewsCount,
+}
+
+impl WorksheetColumn {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Symbol => "SYMBOL",
+            Self::Last => "LAST",
+            Self::ChangePct => "CHG%",
+            Self::ChangeAbs => "CHG",
+            Self::Volume => "VOLUME",
+            Self::QuoteVolume => "TURNOVER",
+            Self::Bid => "BID",
+            Self::Ask => "ASK",
+            Self::SpreadBps => "SPREAD(bps)",
+            Self::PeRatio => "P/E",
+            Self::MarketCap => "MCAP",
+            Self::NewsCount => "NEWS",
+        }
+    }
+
+    pub fn default_weight(self) -> u32 {
+        match self {
+            Self::Symbol => 14,
+            Self::Last => 12,
+            Self::ChangePct => 10,
+            Self::ChangeAbs => 10,
+            Self::Volume => 11,
+            Self::QuoteVolume => 11,
+            Self::Bid => 10,
+            Self::Ask => 10,
+            Self::SpreadBps => 9,
+            Self::PeRatio => 8,
+            Self::MarketCap => 10,
+            Self::NewsCount => 8,
+        }
+    }
+
+    pub fn parse_column(token: &str) -> Option<Self> {
+        let t = token.to_ascii_uppercase();
+        match t.as_str() {
+            "SYM" | "SYMBOL" | "TICKER" => Some(Self::Symbol),
+            "LAST" | "PRICE" => Some(Self::Last),
+            "CHG%" | "CHANGE%" | "CHGPCT" | "PCT" => Some(Self::ChangePct),
+            "CHG" | "CHANGE" | "NET" => Some(Self::ChangeAbs),
+            "VOL" | "VOLUME" => Some(Self::Volume),
+            "QVOL" | "QUOTE_VOL" | "TURNOVER" | "QUOTE" => Some(Self::QuoteVolume),
+            "BID" => Some(Self::Bid),
+            "ASK" => Some(Self::Ask),
+            "SPREAD" | "SPREADBPS" | "BPS" => Some(Self::SpreadBps),
+            "PE" | "P/E" | "PERATIO" => Some(Self::PeRatio),
+            "MCAP" | "MARKETCAP" | "CAP" => Some(Self::MarketCap),
+            "NEWS" | "HEADLINES" | "NEWSCOUNT" => Some(Self::NewsCount),
+            _ => None,
+        }
+    }
+
+    pub fn default_columns() -> Vec<Self> {
+        vec![
+            Self::Symbol,
+            Self::Last,
+            Self::ChangePct,
+            Self::Volume,
+            Self::Bid,
+            Self::Ask,
+            Self::SpreadBps,
+            Self::NewsCount,
+        ]
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Symbol,
+            Self::Last,
+            Self::ChangePct,
+            Self::ChangeAbs,
+            Self::Volume,
+            Self::QuoteVolume,
+            Self::Bid,
+            Self::Ask,
+            Self::SpreadBps,
+            Self::PeRatio,
+            Self::MarketCap,
+            Self::NewsCount,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Worksheet {
+    pub name: String,
+    pub columns: Vec<WorksheetColumn>,
+    pub symbols: Vec<AssetId>,
+}
+
+impl Worksheet {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            columns: WorksheetColumn::default_columns(),
+            symbols: Vec::new(),
+        }
+    }
+
+    pub fn add(&mut self, asset: AssetId) -> bool {
+        if self.symbols.iter().any(|a| a == &asset) {
+            false
+        } else {
+            self.symbols.push(asset);
+            true
+        }
+    }
+
+    pub fn remove(&mut self, asset: &AssetId) -> bool {
+        if let Some(pos) = self.symbols.iter().position(|a| a == asset) {
+            self.symbols.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for Worksheet {
+    fn default() -> Self {
+        Self::new("DEFAULT")
+    }
+}
 impl FromStr for AssetId {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -2020,5 +2310,53 @@ mod tests {
         assert!(ChartDataStatus::AuthenticationRequired.is_actionable_error());
         assert!(ChartDataStatus::RateLimited.is_actionable_error());
         assert!(ChartDataStatus::Error.is_actionable_error());
+    }
+
+    #[test]
+    fn test_worksheet_and_column_model() {
+        assert_eq!(WorksheetColumn::Symbol.label(), "SYMBOL");
+        assert_eq!(WorksheetColumn::Last.label(), "LAST");
+        assert_eq!(
+            WorksheetColumn::parse_column("SYM"),
+            Some(WorksheetColumn::Symbol)
+        );
+        assert_eq!(
+            WorksheetColumn::parse_column("CHG%"),
+            Some(WorksheetColumn::ChangePct)
+        );
+        assert_eq!(
+            WorksheetColumn::parse_column("TURNOVER"),
+            Some(WorksheetColumn::QuoteVolume)
+        );
+        assert_eq!(
+            WorksheetColumn::parse_column("SPREAD"),
+            Some(WorksheetColumn::SpreadBps)
+        );
+        assert_eq!(WorksheetColumn::parse_column("UNKNOWN_XYZ"), None);
+
+        let mut ws = Worksheet::new("TECH");
+        assert_eq!(ws.name, "TECH");
+        assert_eq!(ws.columns, WorksheetColumn::default_columns());
+        assert!(ws.symbols.is_empty());
+
+        let aapl: AssetId = "AAPL".parse().unwrap();
+        let msft: AssetId = "MSFT".parse().unwrap();
+
+        assert!(ws.add(aapl.clone()));
+        assert!(!ws.add(aapl.clone())); // duplicate rejected
+        assert_eq!(ws.symbols.len(), 1);
+
+        assert!(ws.add(msft.clone()));
+        assert_eq!(ws.symbols.len(), 2);
+
+        assert!(ws.remove(&aapl));
+        assert!(!ws.remove(&aapl)); // already removed
+        assert_eq!(ws.symbols.len(), 1);
+        assert_eq!(ws.symbols[0], msft);
+
+        // Serialize and deserialize round-trip
+        let json = serde_json::to_string(&ws).unwrap();
+        let deserialized: Worksheet = serde_json::from_str(&json).unwrap();
+        assert_eq!(ws, deserialized);
     }
 }

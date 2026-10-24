@@ -73,11 +73,28 @@ omt --version
 omt --offline
 ```
 
-The binary is `target/release/omt` (`omt.exe` on Windows). The release workflow
-packages standalone executables for Linux x86_64, macOS ARM64, and Windows x86_64.
-When hosted in GitHub, download the matching `omt-<platform>` workflow artifact,
-extract it with its license notices, and run it in a terminal. No hosted downloads
-have been published from this local implementation.
+### Quick Install (Prebuilt Binaries)
+
+- **Linux & macOS (One-line installer)**:
+  ```sh
+  curl -proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/MuhammedZohaib/open-market-terminal/main/scripts/install.sh | bash
+  ```
+
+- **Windows (PowerShell installer)**:
+  ```powershell
+  irm https://raw.githubusercontent.com/MuhammedZohaib/open-market-terminal/main/scripts/install.ps1 | iex
+  ```
+
+- **Debian / Ubuntu (`.deb`)**:
+  Download `.deb` from [Releases](https://github.com/MuhammedZohaib/open-market-terminal/releases) and install via `sudo dpkg -i omt_<version>_<arch>.deb`.
+
+- **Homebrew (macOS & Linux)**:
+  ```sh
+  brew tap MuhammedZohaib/open-market-terminal https://github.com/MuhammedZohaib/open-market-terminal
+  brew install omt
+  ```
+
+Pre-compiled standalone packages and SHA-256 checksums are published across 9 target architectures (Linux x86_64 glibc/musl, Linux ARM64 glibc/musl, macOS Apple Silicon/Intel/Universal 2, Windows x64/ARM64). See the [Release & Distribution Guide](docs/RELEASE_AND_DISTRIBUTION.md) for full pipeline specifications and verification instructions.
 
 In this Windows workspace, a user-local Rust GNU toolchain and a compiler in
 `.tools/` were installed to perform verification. `.cargo/config.toml` points to

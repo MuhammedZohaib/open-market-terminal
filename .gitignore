@@ -1,7 +1,48 @@
-/target/
-/.tools/
+# Rust build artifacts
+target/
+**/target/
+Cargo.lock.bak
+
+# Node / Frontend build artifacts
+node_modules/
+**/node_modules/
+.pnpm-store/
+dist/
+**/dist/
+build/
+**/build/
+out/
+**/out/
+*.tsbuildinfo
+
+# Compiled Executables, Libraries & Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.obj
+*.o
+*.a
+*.lib
+*.out
+*.app
+*.dmg
+*.msi
+
+# Package archives and checksums
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+*.sha256
+
+# Tooling, IDE and environment
+.tools/
 /.cargo/config.toml
-/.vs/
+.vs/
+.vscode/
+.idea/
 *.sqlite*
 *.log
 .env
@@ -10,3 +51,19 @@
 /config.toml
 /artifacts/
 
+# Temporary and diagnostic files
+*.tmp
+*.bak
+err.txt
+out.txt
+debug_*.txt
+
+# Plans, Audits, and Progress Reports
+*PLAN*.md
+*plan*.md
+*AUDIT*.md
+*audit*.md
+*REPORT*.md
+*report*.md
+*migration*.md
+plans/

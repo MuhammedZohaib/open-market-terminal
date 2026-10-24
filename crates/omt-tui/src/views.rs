@@ -45,8 +45,9 @@ pub fn alerts(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 use omt_core::{
-    ChartDataStatus, DataStatus, Filing, InstrumentInfo, Quote, TradingStatus, analyze_yield_curve,
-    atr, bollinger_bands, ema, facts, macd, portfolio::positions, rsi, sma, window_stats,
+    ChartDataStatus, DataStatus, Filing, InstrumentInfo, Quote, TradingStatus, WorksheetColumn,
+    analyze_yield_curve, atr, bollinger_bands, ema, facts, macd, portfolio::positions, rsi, sma,
+    window_stats,
 };
 use rust_decimal::{
     Decimal,
@@ -1345,6 +1346,7 @@ pub fn active_row_count(app: &App) -> usize {
     match app.workspace {
         Workspace::Market => match app.market_mode {
             MarketMode::Wei => 12,
+            MarketMode::Worksheet => app.worksheet.symbols.len(),
             _ => filtered_market_keys(app).len(),
         },
         Workspace::Scan => match app.scan_mode {
@@ -1365,10 +1367,21 @@ pub fn active_row_count(app: &App) -> usize {
         Workspace::Econ => app.macro_data.len(),
         Workspace::Impact => app.impact.as_ref().map(|d| d.news.len()).unwrap_or(0),
         Workspace::Chart => app.market.candles.len(),
+        Workspace::Des => 1,
     }
 }
 
 pub fn selected_market_instrument(app: &App) -> Option<String> {
+    if app.market_mode == MarketMode::Worksheet {
+        return app
+            .worksheet
+            .symbols
+            .get(
+                app.cursor
+                    .min(app.worksheet.symbols.len().saturating_sub(1)),
+            )
+            .map(|a| a.key());
+    }
     if let Some(ref sel) = app.selected_market_key
         && (app.market.quotes.contains_key(sel) || app.market.instruments.contains_key(sel))
     {
@@ -1442,6 +1455,7 @@ pub fn main(frame: &mut Frame, app: &App, area: Rect) {
         Workspace::Port => portfolio(frame, app, area),
         Workspace::Econ => economics(frame, app, area),
         Workspace::Impact => impact(frame, app, area),
+        Workspace::Des => security_description(frame, app, area),
     }
 }
 
@@ -1616,7 +1630,330 @@ fn render_market_table(
     visible_slice.len()
 }
 
+pub fn render_worksheet(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(6)]).split(area);
+
+    let symbols = &app.worksheet.symbols;
+    let mut advancers = 0usize;
+    let mut decliners = 0usize;
+    let mut unchanged = 0usize;
+    for asset in symbols {
+        if let Some(q) = app.market.quotes.get(&asset.key()) {
+            match q.effective_change_pct() {
+                Some(p) if p > Decimal::ZERO => advancers += 1,
+                Some(p) if p < Decimal::ZERO => decliners += 1,
+                _ => unchanged += 1,
+            }
+        }
+    }
+
+    let cols_summary = app
+        .worksheet
+        .columns
+        .iter()
+        .map(|c| c.label())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled(" WORKSHEET ", Style::default().fg(BG).bg(AMBER).bold()),
+            Span::styled(
+                format!(
+                    "  [{}]  │  {} securities tracked",
+                    app.worksheet.name,
+                    symbols.len()
+                ),
+                Style::default().fg(FG).bold(),
+            ),
+            Span::styled("  │  Breadth: ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                format!("+{advancers} "),
+                Style::default().fg(POSITIVE).bold(),
+            ),
+            Span::styled(
+                format!("-{decliners} "),
+                Style::default().fg(NEGATIVE).bold(),
+            ),
+            Span::styled(format!("={unchanged}"), Style::default().fg(MUTED)),
+            Span::styled(
+                format!("  │  Cols: {cols_summary}"),
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" Drilldown: ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                "[Enter/g] GP  [d] DES  [f] FA  [n] CN  [x] Del  │  ",
+                Style::default().fg(AMBER).bold(),
+            ),
+            Span::styled("Commands: ", Style::default().fg(SECONDARY)),
+            Span::styled(
+                "W ADD <SYM>  │  W DEL <SYM>  │  W COL <COLS>  │  W CREATE <NAME>  │  W LIST",
+                Style::default().fg(FG),
+            ),
+        ]),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(header_lines).style(Style::default().bg(ELEVATED_BG)),
+        chunks[0],
+    );
+
+    if symbols.is_empty() {
+        let empty_msg = vec![
+            Line::from(""),
+            Line::styled(
+                format!(
+                    "  No securities currently in worksheet '{}'",
+                    app.worksheet.name
+                ),
+                Style::default().fg(AMBER).bold(),
+            ),
+            Line::from(""),
+            Line::styled("  Quick Actions:", Style::default().fg(FG).bold()),
+            Line::from(vec![
+                Span::styled("  • Add security:     ", Style::default().fg(SECONDARY)),
+                Span::styled("W ADD AAPL", Style::default().fg(AMBER)),
+                Span::styled("  or  ", Style::default().fg(MUTED)),
+                Span::styled("W ADD BTCUSDT", Style::default().fg(AMBER)),
+                Span::styled("  (or type ticker first: ", Style::default().fg(MUTED)),
+                Span::styled("AAPL W ADD", Style::default().fg(AMBER)),
+                Span::styled(")", Style::default().fg(MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled("  • Switch worksheet: ", Style::default().fg(SECONDARY)),
+                Span::styled("W DEFAULT", Style::default().fg(FG)),
+                Span::styled("  or  ", Style::default().fg(MUTED)),
+                Span::styled("W TECH", Style::default().fg(FG)),
+            ]),
+            Line::from(vec![
+                Span::styled("  • Create new list:  ", Style::default().fg(SECONDARY)),
+                Span::styled("W CREATE TECH_MAJORS", Style::default().fg(FG)),
+            ]),
+            Line::from(vec![
+                Span::styled("  • List worksheets:  ", Style::default().fg(SECONDARY)),
+                Span::styled("W LIST", Style::default().fg(FG)),
+            ]),
+            Line::from(vec![
+                Span::styled("  • Configure columns:", Style::default().fg(SECONDARY)),
+                Span::styled(
+                    "W COL SYM LAST CHG% VOL BID ASK SPREAD NEWS",
+                    Style::default().fg(FG),
+                ),
+            ]),
+        ];
+        frame.render_widget(
+            Paragraph::new(empty_msg).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Worksheet: {} (Empty) ", app.worksheet.name))
+                    .border_style(Style::default().fg(BORDER)),
+            ),
+            chunks[1],
+        );
+        return;
+    }
+
+    let visible_capacity = chunks[1].height.saturating_sub(3).max(1) as usize;
+    let selected_idx = app.cursor.min(symbols.len().saturating_sub(1));
+    let win_start = if selected_idx >= visible_capacity {
+        selected_idx + 1 - visible_capacity
+    } else {
+        0
+    };
+    let win_end = (win_start + visible_capacity).min(symbols.len());
+    let visible_slice = &symbols[win_start..win_end];
+
+    let rows = visible_slice.iter().enumerate().map(|(slice_idx, asset)| {
+        let is_selected = slice_idx + win_start == selected_idx;
+        let is_loaded_global = *asset == app.asset;
+        let q = app.market.quotes.get(&asset.key());
+        let chg_pct = q.and_then(|q| q.effective_change_pct());
+        let dir_color = theme::direction_color(chg_pct);
+
+        let cells: Vec<Cell> = app
+            .worksheet
+            .columns
+            .iter()
+            .map(|col| match col {
+                WorksheetColumn::Symbol => {
+                    let sym_color = if is_loaded_global {
+                        AMBER
+                    } else if is_selected {
+                        CYAN
+                    } else {
+                        FG
+                    };
+                    Cell::from(asset.symbol.clone()).style(Style::default().fg(sym_color).bold())
+                }
+                WorksheetColumn::Last => {
+                    let s = q
+                        .map(|q| format_price(q.price))
+                        .unwrap_or_else(|| "—".into());
+                    Cell::from(s).style(Style::default().fg(FG))
+                }
+                WorksheetColumn::ChangePct => {
+                    let s = chg_pct
+                        .map(|p| format!("{p:+.2}%"))
+                        .unwrap_or_else(|| "—".into());
+                    Cell::from(s).style(Style::default().fg(dir_color).bold())
+                }
+                WorksheetColumn::ChangeAbs => {
+                    let s = q
+                        .and_then(|q| q.effective_change_abs())
+                        .map(format_signed_price)
+                        .unwrap_or_else(|| "—".into());
+                    Cell::from(s).style(Style::default().fg(dir_color))
+                }
+                WorksheetColumn::Volume => {
+                    let s = q
+                        .and_then(|q| q.volume)
+                        .map(number)
+                        .unwrap_or_else(|| "—".into());
+                    Cell::from(s).style(Style::default().fg(FG))
+                }
+                WorksheetColumn::QuoteVolume => {
+                    let s = q
+                        .and_then(|q| q.quote_volume)
+                        .map(number)
+                        .unwrap_or_else(|| "—".into());
+                    Cell::from(s).style(Style::default().fg(AMBER))
+                }
+                WorksheetColumn::Bid => {
+                    let s = q
+                        .and_then(|q| q.bid)
+                        .map(format_price)
+                        .unwrap_or_else(|| "—".into());
+                    Cell::from(s).style(Style::default().fg(SECONDARY))
+                }
+                WorksheetColumn::Ask => {
+                    let s = q
+                        .and_then(|q| q.ask)
+                        .map(format_price)
+                        .unwrap_or_else(|| "—".into());
+                    Cell::from(s).style(Style::default().fg(SECONDARY))
+                }
+                WorksheetColumn::SpreadBps => {
+                    let s = q
+                        .and_then(|q| q.spread_bps())
+                        .map(|b| format!("{b:.1}"))
+                        .unwrap_or_else(|| "—".into());
+                    Cell::from(s).style(Style::default().fg(MUTED))
+                }
+                WorksheetColumn::PeRatio => {
+                    let pe = app
+                        .companies
+                        .iter()
+                        .find(|c| c.ticker.eq_ignore_ascii_case(&asset.symbol))
+                        .or_else(|| {
+                            app.company
+                                .as_ref()
+                                .filter(|c| c.ticker.eq_ignore_ascii_case(&asset.symbol))
+                        })
+                        .and_then(|c| {
+                            let ni = c.facts.iter().find(|f| f.metric == "Net income")?.value;
+                            let price = q?.price;
+                            if ni > Decimal::ZERO {
+                                Some(format!("{:.1}x", price))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| "—".into());
+                    Cell::from(pe).style(Style::default().fg(FG))
+                }
+                WorksheetColumn::MarketCap => {
+                    let mcap = app
+                        .companies
+                        .iter()
+                        .find(|c| c.ticker.eq_ignore_ascii_case(&asset.symbol))
+                        .or_else(|| {
+                            app.company
+                                .as_ref()
+                                .filter(|c| c.ticker.eq_ignore_ascii_case(&asset.symbol))
+                        })
+                        .and_then(|c| {
+                            let rev = c.facts.iter().find(|f| f.metric == "Revenue")?.value;
+                            Some(number(rev))
+                        })
+                        .unwrap_or_else(|| "—".into());
+                    Cell::from(mcap).style(Style::default().fg(SECONDARY))
+                }
+                WorksheetColumn::NewsCount => {
+                    let count = app
+                        .news_items
+                        .iter()
+                        .filter(|n| {
+                            if let Some(ref t) = n.ticker
+                                && (t.eq_ignore_ascii_case(&asset.symbol)
+                                    || t.eq_ignore_ascii_case(asset.base_asset()))
+                            {
+                                return true;
+                            }
+                            n.headline.contains(&asset.symbol)
+                                || n.headline.contains(asset.base_asset())
+                        })
+                        .count();
+                    let s = if count > 0 {
+                        format!("{count}")
+                    } else {
+                        "—".into()
+                    };
+                    Cell::from(s).style(Style::default().fg(CYAN))
+                }
+            })
+            .collect();
+
+        Row::new(cells)
+    });
+
+    let total_weight: u32 = app
+        .worksheet
+        .columns
+        .iter()
+        .map(|c| c.default_weight())
+        .sum();
+    let constraints: Vec<Constraint> = app
+        .worksheet
+        .columns
+        .iter()
+        .map(|c| Constraint::Ratio(c.default_weight(), total_weight.max(1)))
+        .collect();
+
+    let header_cells: Vec<Cell> = app
+        .worksheet
+        .columns
+        .iter()
+        .map(|c| Cell::from(c.label()))
+        .collect();
+
+    let mut state =
+        TableState::default().with_selected(Some(selected_idx.saturating_sub(win_start)));
+
+    let table = Table::new(rows, constraints)
+        .header(Row::new(header_cells).style(theme::header_style()))
+        .row_highlight_style(theme::row_highlight_style())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(
+                    " Worksheet: {} — {} / {} securities (Enter/g: GP, d: DES, f: FA, n: CN) ",
+                    app.worksheet.name,
+                    selected_idx + 1,
+                    symbols.len()
+                ))
+                .border_style(Style::default().fg(if app.focus == 1 { AMBER } else { BORDER })),
+        );
+
+    frame.render_stateful_widget(table, chunks[1], &mut state);
+}
+
 pub fn market(frame: &mut Frame, app: &App, area: Rect) {
+    if app.market_mode == MarketMode::Worksheet {
+        render_worksheet(frame, app, area);
+        return;
+    }
     if app.market_mode == MarketMode::Wei {
         render_wei(frame, app, area);
         return;
@@ -2681,6 +3018,14 @@ fn render_fin_secondary_analysis(
             .block(block(" SEC Filings Archive (Press 'o' to open) ", false)),
             cols[2],
         );
+    }
+}
+
+pub fn security_description(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(company) = &app.company {
+        render_security_description(frame, app, area, company);
+    } else {
+        render_crypto_security_description(frame, app, area);
     }
 }
 
@@ -5366,6 +5711,128 @@ pub fn context_text(app: &App) -> Option<String> {
                     .map(|(m, s, h)| format!("{:.2} / sig {:.2} / hist {:+.2}", m, s, h))
                     .unwrap_or_else(|| "—".into())
             ))
+        }
+        Workspace::Market => {
+            if app.market_mode == MarketMode::Worksheet {
+                let asset = app.worksheet.symbols.get(
+                    app.cursor
+                        .min(app.worksheet.symbols.len().saturating_sub(1)),
+                )?;
+                let q = app.market.quotes.get(&asset.key());
+                let now = Utc::now();
+                Some(format!(
+                    "WORKSHEET INSPECTOR\nList: {} (Item {} of {})\n\nSymbol: {}\nVenue: {}\nAsset Class: {:?}\nBase / Quote: {} / {}\n\nMarket Depth & Pricing:\nLast: {}\n24h Change: {}\n24h High: {}\n24h Low: {}\nBid: {}\nAsk: {}\nSpread: {}\nVolume: {}\nTurnover: {}\n\nRelated Functions:\n[Enter / g] GP  Price Graph\n[d]         DES Security Description\n[f]         FA  Financial Analysis\n[n]         CN  Company News\n[x]         Remove from Worksheet\n\nData Status: {}",
+                    app.worksheet.name,
+                    app.cursor + 1,
+                    app.worksheet.symbols.len(),
+                    asset.symbol,
+                    asset.venue,
+                    asset.asset_class,
+                    asset.base_asset(),
+                    asset.currency(),
+                    q.map(|x| format!("{} {}", format_price(x.price), x.currency))
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.effective_change_pct())
+                        .map(|p| format!("{p:+.2}%"))
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.high)
+                        .map(format_price)
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.low)
+                        .map(format_price)
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.bid)
+                        .map(format_price)
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.ask)
+                        .map(format_price)
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.spread_bps())
+                        .map(|b| format!("{b:.1} bps"))
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.volume)
+                        .map(number)
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.quote_volume)
+                        .map(number)
+                        .unwrap_or_else(|| "—".into()),
+                    q.map(|x| format!("{:?}", x.status_at(now)))
+                        .unwrap_or_else(|| "No feed".into())
+                ))
+            } else if let Some(key) = selected_market_instrument(app) {
+                let q = app.market.quotes.get(&key);
+                let info = app.market.instruments.get(&key);
+                let now = Utc::now();
+                Some(format!(
+                    "MARKET INSPECTOR\nInstrument: {}\nVenue: {}\nStatus: {}\n\nPrice: {}\n24h Change: {}\n24h High: {}\n24h Low: {}\nBid: {}\nAsk: {}\nSpread: {}\nVolume: {}\nQuote Volume: {}\n\nRelated Functions:\n[Enter] GP  Chart\n[d]     DES Description\n[w]     Add to Worksheet\n\nFeed Freshness: {}",
+                    key,
+                    info.map(|i| i.asset.venue.to_string())
+                        .unwrap_or_else(|| "BINANCE".into()),
+                    info.map(|i| i.status.to_string())
+                        .unwrap_or_else(|| "Trading".into()),
+                    q.map(|x| format!("{} {}", format_price(x.price), x.currency))
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.effective_change_pct())
+                        .map(|p| format!("{p:+.2}%"))
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.high)
+                        .map(format_price)
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.low)
+                        .map(format_price)
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.bid)
+                        .map(format_price)
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.ask)
+                        .map(format_price)
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.spread_bps())
+                        .map(|b| format!("{b:.1} bps"))
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.volume)
+                        .map(number)
+                        .unwrap_or_else(|| "—".into()),
+                    q.and_then(|x| x.quote_volume)
+                        .map(number)
+                        .unwrap_or_else(|| "—".into()),
+                    q.map(|x| format!("{:?}", x.status_at(now)))
+                        .unwrap_or_else(|| "No feed".into())
+                ))
+            } else {
+                None
+            }
+        }
+        Workspace::Des => {
+            if let Some(c) = &app.company {
+                Some(format!(
+                    "{}\nCIK {:010}\nTicker: {}\nVenue: IEX (US Equity)\n\nSEC Reporting:\nFilings: {}\nJurisdiction: US GAAP XBRL\nPeriod: {:?}\nLink Group: {}\n\nRelated Functions:\n[2:GP] Price Graph\n[3:FA] Financial Analysis\n[4:CN] Company News\n[5:EQS] Screener\n[O] Open Filing\n\nFetched: {}",
+                    c.name,
+                    c.cik,
+                    c.ticker,
+                    c.filings.len(),
+                    app.period,
+                    app.link_group.label(),
+                    c.fetched_at.format("%Y-%m-%d %H:%M UTC")
+                ))
+            } else {
+                let key = app.asset.key();
+                let q = app.market.quotes.get(&key);
+                Some(format!(
+                    "{}\nVenue: {}\nAsset Class: Crypto Spot\nBase: {}\nQuote: {}\n\nMarket Depth:\nLast: {}\nBid: {}\nAsk: {}\nSpread: {}\nLink Group: {}\n\nRelated Functions:\n[2:GP] Price Graph\n[4:CN] News Feeds\n[1:MKT] Market Overview\n[5:EQS] Crypto Screener\n\nData Status: Live",
+                    app.asset.symbol,
+                    app.asset.venue,
+                    app.asset.base_asset(),
+                    app.asset.currency(),
+                    q.map(|x| number(x.price)).unwrap_or_else(|| "--".into()),
+                    q.and_then(|x| x.bid).map(number).unwrap_or_else(|| "--".into()),
+                    q.and_then(|x| x.ask).map(number).unwrap_or_else(|| "--".into()),
+                    q.and_then(|x| x.spread_bps())
+                        .map(|b| format!("{b:.1} bps"))
+                        .unwrap_or_else(|| "--".into()),
+                    app.link_group.label()
+                ))
+            }
         }
         _ => None,
     }

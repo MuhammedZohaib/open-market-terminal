@@ -1257,6 +1257,7 @@ dependencies = [
  "chrono",
  "rust_decimal",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1286,6 +1287,24 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "omt-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "omt-core",
+ "omt-data",
+ "omt-providers",
+ "omt-storage",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 

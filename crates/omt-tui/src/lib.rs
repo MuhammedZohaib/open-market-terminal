@@ -4,8 +4,8 @@ pub mod views;
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use omt_core::{
-    AssetId, ChartDataStatus, Company, MacroObservation, NewsCategory, NewsItem, PeriodView,
-    Timeframe, Venue,
+    AssetId, ChartDataStatus, Company, LinkGroup, MacroObservation, NewsCategory, NewsItem,
+    PeriodView, Timeframe, Venue,
     command::{self, Workspace},
     facts::StatementTab,
     portfolio::Transaction,
@@ -106,6 +106,7 @@ pub enum MarketMode {
     Overview,
     Crypto,
     Wei,
+    Worksheet,
 }
 impl MarketMode {
     pub fn label(self) -> &'static str {
@@ -113,6 +114,7 @@ impl MarketMode {
             Self::Overview => "MARKET OVERVIEW",
             Self::Crypto => "CRYPTO SPOT UNIVERSE",
             Self::Wei => "WORLD EQUITY INDICES (WEI)",
+            Self::Worksheet => "WORKSHEET (W)",
         }
     }
 }
@@ -149,6 +151,7 @@ pub struct App {
     pub timeframe: Timeframe,
     pub market: MarketState,
     pub watchlist: Vec<AssetId>,
+    pub worksheet: omt_core::Worksheet,
     pub list_name: String,
     pub focus: usize,
     pub cursor: usize,
@@ -208,6 +211,10 @@ pub struct App {
     pub catalog: Vec<String>,
     pub research_status: String,
     pub global_asset: AssetId,
+    pub link_group: LinkGroup,
+    pub quad_workspaces: [Workspace; 4],
+    pub quad_link_groups: [LinkGroup; 4],
+    pub quad_assets: [AssetId; 4],
     pub econ_axis_categorical: bool,
     pub quad_focus: usize,
     pub news_cursor: usize,
@@ -234,6 +241,20 @@ impl Default for App {
             workspace: Workspace::Market,
             asset: default_crypto.clone(),
             global_asset: default_crypto.clone(),
+            link_group: LinkGroup::A,
+            quad_workspaces: [
+                Workspace::Market,
+                Workspace::Chart,
+                Workspace::News,
+                Workspace::Des,
+            ],
+            quad_link_groups: [LinkGroup::A, LinkGroup::A, LinkGroup::A, LinkGroup::A],
+            quad_assets: [
+                default_crypto.clone(),
+                default_crypto.clone(),
+                default_crypto.clone(),
+                default_equity.clone(),
+            ],
             econ_axis_categorical: true,
             quad_focus: 0,
             news_cursor: 0,
@@ -246,6 +267,7 @@ impl Default for App {
                 ..Default::default()
             },
             watchlist: vec![],
+            worksheet: omt_core::Worksheet::default(),
             list_name: "default".into(),
             focus: 1,
             cursor: 0,
@@ -326,7 +348,15 @@ impl App {
         if self.recent_securities.len() > 8 {
             self.recent_securities.truncate(8);
         }
-        self.asset = asset;
+        self.asset = asset.clone();
+        self.global_asset = asset.clone();
+
+        // Synchronize all Launchpad panes sharing the current link group
+        for i in 0..4 {
+            if self.quad_link_groups[i] == self.link_group {
+                self.quad_assets[i] = asset.clone();
+            }
+        }
     }
     pub fn record_draw_micros(&mut self, us: u64) {
         if self.draw_samples_us.len() >= 256 {
@@ -609,7 +639,7 @@ impl App {
                     "Diagnostics overlay hidden".into()
                 };
             }
-            KeyCode::Char(c @ '1'..='8') => {
+            KeyCode::Char(c @ '1'..='9') => {
                 let target = Workspace::ALL[c as usize - '1' as usize];
                 if target != self.workspace {
                     self.workspace_history
@@ -620,7 +650,7 @@ impl App {
                 self.workspace = target;
                 return Some(self.workspace.name().into());
             }
-            KeyCode::F(n @ 2..=9) => {
+            KeyCode::F(n @ 2..=10) => {
                 let target = Workspace::ALL[(n - 2) as usize];
                 if target != self.workspace {
                     self.workspace_history
@@ -707,13 +737,125 @@ impl App {
                 self.panel_width_offset = (self.panel_width_offset + 2).min(16);
                 self.message = format!("Side panel width offset: {:+}", self.panel_width_offset);
             }
-            KeyCode::Char('d') if matches!(self.workspace, Workspace::Fin | Workspace::Chart) => {
-                self.des_mode = !self.des_mode;
-                self.message = if self.des_mode {
-                    "Security Description <DES> view enabled (press d to toggle)".into()
+            KeyCode::Char('K') => {
+                if self.layout_mode == LayoutMode::Quad {
+                    self.quad_link_groups[self.quad_focus] =
+                        self.quad_link_groups[self.quad_focus].next();
+                    self.message = format!(
+                        "Launchpad Pane {} Link Group: {}",
+                        self.quad_focus + 1,
+                        self.quad_link_groups[self.quad_focus].label()
+                    );
                 } else {
-                    "Standard workspace view restored".into()
-                };
+                    self.link_group = self.link_group.next();
+                    self.message = format!("Active Link Group: {}", self.link_group.label());
+                }
+            }
+            KeyCode::Char('d') => {
+                if self.workspace == Workspace::Market
+                    && self.market_mode == MarketMode::Worksheet
+                    && let Some(a) = self.worksheet.symbols.get(
+                        self.cursor
+                            .min(self.worksheet.symbols.len().saturating_sub(1)),
+                    )
+                {
+                    let target = a.clone();
+                    self.set_active_asset(target.clone());
+                    self.workspace_history
+                        .push((self.workspace, self.asset.clone()));
+                    self.workspace = Workspace::Des;
+                    self.des_mode = true;
+                    self.cursor = 0;
+                    self.message = format!("Security Description <DES> — {}", target.key());
+                    return Some(format!("DES {}", target.key()));
+                }
+                if self.workspace == Workspace::Des {
+                    if let Some((prev_ws, prev_asset)) = self.workspace_history.pop() {
+                        self.workspace = prev_ws;
+                        self.set_active_asset(prev_asset);
+                    } else {
+                        self.workspace = Workspace::Chart;
+                    }
+                    self.des_mode = false;
+                    self.message = format!("Returned to workspace: {}", self.workspace.name());
+                } else {
+                    self.workspace_history
+                        .push((self.workspace, self.asset.clone()));
+                    self.workspace = Workspace::Des;
+                    self.des_mode = true;
+                    self.cursor = 0;
+                    self.message = format!("Security Description <DES> — {}", self.asset.key());
+                    return Some("DES".into());
+                }
+            }
+            KeyCode::Char('g') if self.workspace == Workspace::Des => {
+                self.workspace = Workspace::Chart;
+                self.des_mode = false;
+                self.message = format!("Price Graph <GP> — {}", self.asset.key());
+                return Some("GP".into());
+            }
+            KeyCode::Char('f') if self.workspace == Workspace::Des => {
+                self.workspace = Workspace::Fin;
+                self.des_mode = false;
+                self.message = format!("Financial Analysis <FA> — {}", self.asset.key());
+                return Some("FA".into());
+            }
+            KeyCode::Char('n') if self.workspace == Workspace::Des => {
+                self.workspace = Workspace::News;
+                self.des_mode = false;
+                self.message = format!("Company News <CN> — {}", self.asset.key());
+                return Some("CN".into());
+            }
+            KeyCode::Char('s') if self.workspace == Workspace::Des => {
+                self.workspace = Workspace::Scan;
+                self.des_mode = false;
+                self.message = "Screening <EQS>".into();
+                return Some("EQS".into());
+            }
+            KeyCode::Char('g')
+                if self.workspace == Workspace::Market
+                    && self.market_mode == MarketMode::Worksheet =>
+            {
+                if let Some(a) = self.worksheet.symbols.get(
+                    self.cursor
+                        .min(self.worksheet.symbols.len().saturating_sub(1)),
+                ) {
+                    let target = a.clone();
+                    self.set_active_asset(target.clone());
+                    self.workspace = Workspace::Chart;
+                    self.message = format!("Price Graph <GP> — {}", target.key());
+                    return Some(format!("CHART {}", target.key()));
+                }
+            }
+            KeyCode::Char('f')
+                if self.workspace == Workspace::Market
+                    && self.market_mode == MarketMode::Worksheet =>
+            {
+                if let Some(a) = self.worksheet.symbols.get(
+                    self.cursor
+                        .min(self.worksheet.symbols.len().saturating_sub(1)),
+                ) {
+                    let target = a.clone();
+                    self.set_active_asset(target.clone());
+                    self.workspace = Workspace::Fin;
+                    self.message = format!("Financial Analysis <FA> — {}", target.key());
+                    return Some(format!("FIN {}", target.key()));
+                }
+            }
+            KeyCode::Char('n')
+                if self.workspace == Workspace::Market
+                    && self.market_mode == MarketMode::Worksheet =>
+            {
+                if let Some(a) = self.worksheet.symbols.get(
+                    self.cursor
+                        .min(self.worksheet.symbols.len().saturating_sub(1)),
+                ) {
+                    let target = a.clone();
+                    self.set_active_asset(target.clone());
+                    self.workspace = Workspace::News;
+                    self.message = format!("Company News <CN> — {}", target.key());
+                    return Some(format!("NEWS {}", target.key()));
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.focus == 0 {
@@ -823,7 +965,16 @@ impl App {
                         return Some(format!("CHART {}", a.key()));
                     }
                 } else if self.workspace == Workspace::Market {
-                    if let Some(key) = views::selected_market_instrument(self) {
+                    if self.market_mode == MarketMode::Worksheet {
+                        if let Some(a) = self.worksheet.symbols.get(
+                            self.cursor
+                                .min(self.worksheet.symbols.len().saturating_sub(1)),
+                        ) {
+                            let target = a.clone();
+                            self.set_active_asset(target.clone());
+                            return Some(format!("CHART {}", target.key()));
+                        }
+                    } else if let Some(key) = views::selected_market_instrument(self) {
                         return Some(format!("CHART {key}"));
                     }
                 } else if self.workspace == Workspace::Scan {
@@ -921,6 +1072,28 @@ impl App {
             KeyCode::Char('l') if matches!(self.workspace, Workspace::Market | Workspace::Scan) => {
                 self.cycle_min_volume();
             }
+            KeyCode::Char('x')
+                if self.workspace == Workspace::Market
+                    && self.market_mode == MarketMode::Worksheet =>
+            {
+                if let Some(a) = self.worksheet.symbols.get(
+                    self.cursor
+                        .min(self.worksheet.symbols.len().saturating_sub(1)),
+                ) {
+                    return Some(format!("W DEL {}", a.symbol));
+                }
+            }
+            KeyCode::Delete
+                if self.workspace == Workspace::Market
+                    && self.market_mode == MarketMode::Worksheet =>
+            {
+                if let Some(a) = self.worksheet.symbols.get(
+                    self.cursor
+                        .min(self.worksheet.symbols.len().saturating_sub(1)),
+                ) {
+                    return Some(format!("W DEL {}", a.symbol));
+                }
+            }
             KeyCode::Char('x') if matches!(self.workspace, Workspace::Market | Workspace::Scan) => {
                 self.status_filter_trading_only = !self.status_filter_trading_only;
                 self.cursor = 0;
@@ -983,7 +1156,8 @@ impl App {
                 self.market_mode = match self.market_mode {
                     MarketMode::Overview => MarketMode::Crypto,
                     MarketMode::Crypto => MarketMode::Wei,
-                    MarketMode::Wei => MarketMode::Overview,
+                    MarketMode::Wei => MarketMode::Worksheet,
+                    MarketMode::Worksheet => MarketMode::Overview,
                 };
                 if self.market_mode == MarketMode::Crypto && self.quote_filter == "USDT" {
                     self.quote_filter = "ALL".into();
@@ -1385,6 +1559,13 @@ fn shortcut_keycaps_for_workspace(workspace: Workspace) -> Vec<(&'static str, &'
             ("L", "Layout"),
             ("F1", "Help"),
         ],
+        Workspace::Des => vec![
+            ("/", "Search"),
+            (":", "GO>"),
+            ("Tab", "Focus"),
+            ("Enter", "Details"),
+            ("F1", "Help"),
+        ],
     }
 }
 
@@ -1730,6 +1911,14 @@ fn workspace_provider_summary(app: &App) -> (&'static str, String, Color) {
                 POSITIVE,
             )
         }
+        Workspace::Des => (
+            "Security Profile",
+            app.company
+                .as_ref()
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "Tearsheet & Profile".into()),
+            SECONDARY,
+        ),
     }
 }
 
@@ -1817,6 +2006,10 @@ fn render_inner(frame: &mut Frame, app: &App) {
                 format!("[{}] ", app.layout_mode.label()),
                 Style::default().fg(theme::CYAN).bold(),
             ),
+            Span::styled(
+                format!("[{}] ", app.link_group.label()),
+                Style::default().fg(theme::AMBER).bold(),
+            ),
             Span::styled(recent_trail, Style::default().fg(MUTED)),
             Span::styled(format!("{provider_name}: "), Style::default().fg(SECONDARY)),
             Span::styled("● ", Style::default().fg(health_color)),
@@ -1832,7 +2025,7 @@ fn render_inner(frame: &mut Frame, app: &App) {
     );
 
     // Row 1: High-Contrast Workspace Function Tabs & Live Keyboard Focus Ribbon
-    let is_compact_ribbon = area.width < 100;
+    let is_compact_ribbon = area.width < 160;
     let mut nav_spans = Vec::new();
 
     for (i, w) in Workspace::ALL.iter().enumerate() {
@@ -1977,18 +2170,18 @@ fn render_inner(frame: &mut Frame, app: &App) {
                     Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                         .split(v_split[1]);
 
-                render_workspace_pane(frame, app, Workspace::Market, top_cols[0]);
+                render_workspace_pane(frame, app, app.quad_workspaces[0], top_cols[0]);
 
                 if app.market.candles.is_empty()
                     && app.market.chart_status != ChartDataStatus::Loading
                 {
                     views::render_market_pulse_card(frame, app, top_cols[1], app.quad_focus == 1);
                 } else {
-                    render_workspace_pane(frame, app, Workspace::Chart, top_cols[1]);
+                    render_workspace_pane(frame, app, app.quad_workspaces[1], top_cols[1]);
                 }
 
-                render_workspace_pane(frame, app, Workspace::News, bot_cols[0]);
-                render_workspace_pane(frame, app, fourth, bot_cols[1]);
+                render_workspace_pane(frame, app, app.quad_workspaces[2], bot_cols[0]);
+                render_workspace_pane(frame, app, app.quad_workspaces[3], bot_cols[1]);
             }
         }
         LayoutMode::Standard => {
@@ -2170,6 +2363,7 @@ fn render_workspace_pane(frame: &mut Frame, app: &App, workspace: Workspace, are
         Workspace::Port => views::portfolio(frame, app, area),
         Workspace::Econ => views::economics(frame, app, area),
         Workspace::Impact => views::impact(frame, app, area),
+        Workspace::Des => views::security_description(frame, app, area),
     }
 }
 
@@ -2183,6 +2377,7 @@ fn render_secondary_panel(frame: &mut Frame, app: &App, area: Rect) {
         Workspace::Port => Workspace::Chart,
         Workspace::Econ => Workspace::Chart,
         Workspace::Impact => Workspace::News,
+        Workspace::Des => Workspace::News,
     };
     render_workspace_pane(frame, app, companion, area);
 }
@@ -3148,7 +3343,7 @@ mod tests {
         app.show_context = true;
 
         // Verify Tab Ribbon and Focus Badge rendering
-        let mut t = Terminal::new(TestBackend::new(140, 35)).unwrap();
+        let mut t = Terminal::new(TestBackend::new(180, 35)).unwrap();
         t.draw(|f| render(f, &app)).unwrap();
         let text: String = t
             .backend()
@@ -3417,5 +3612,100 @@ mod tests {
         assert!(text.contains("Story Context"));
         assert!(text.contains("CNBC"));
         assert!(text.contains("US10Y"));
+    }
+
+    #[test]
+    fn worksheet_rendering_navigation_and_one_key_drilldown() {
+        let mut app = App {
+            workspace: Workspace::Market,
+            market_mode: MarketMode::Worksheet,
+            ..Default::default()
+        };
+
+        let mut ws = omt_core::Worksheet::new("TECH_PORTFOLIO");
+        let aapl: AssetId = "AAPL".parse().unwrap();
+        let btc: AssetId = "BTCUSDT".parse().unwrap();
+        ws.add(aapl.clone());
+        ws.add(btc.clone());
+        app.worksheet = ws;
+
+        // Render on 140x40
+        let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        t.draw(|f| render(f, &app)).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(text.contains("WORKSHEET"));
+        assert!(text.contains("TECH_PORTFOLIO"));
+        assert!(text.contains("AAPL"));
+        assert!(text.contains("BTCUSDT"));
+
+        // Context inspector provides Worksheet inspection
+        let ctx = views::context_text(&app).unwrap();
+        assert!(ctx.contains("WORKSHEET INSPECTOR"));
+        assert!(ctx.contains("TECH_PORTFOLIO"));
+        assert!(ctx.contains("AAPL"));
+
+        // One-key drilldown: 'g' opens Chart (GP) for AAPL
+        let cmd_g = app.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(cmd_g, Some(format!("CHART {}", aapl.key())));
+        assert_eq!(app.workspace, Workspace::Chart);
+        assert_eq!(app.asset, aapl);
+
+        // Switch back to Market Worksheet
+        app.workspace = Workspace::Market;
+        app.market_mode = MarketMode::Worksheet;
+
+        // One-key drilldown: 'd' opens DES for AAPL
+        let cmd_d = app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(cmd_d, Some(format!("DES {}", aapl.key())));
+        assert_eq!(app.workspace, Workspace::Des);
+        assert_eq!(app.asset, aapl);
+
+        // Select BTCUSDT (cursor = 1)
+        app.workspace = Workspace::Market;
+        app.market_mode = MarketMode::Worksheet;
+        app.cursor = 1;
+
+        // One-key drilldown: 'f' opens FIN for BTCUSDT
+        let cmd_f = app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(cmd_f, Some(format!("FIN {}", btc.key())));
+        assert_eq!(app.workspace, Workspace::Fin);
+        assert_eq!(app.asset, btc);
+
+        // One-key drilldown: 'n' opens News for BTCUSDT
+        app.workspace = Workspace::Market;
+        app.market_mode = MarketMode::Worksheet;
+        app.cursor = 1;
+        let cmd_n = app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(cmd_n, Some(format!("NEWS {}", btc.key())));
+        assert_eq!(app.workspace, Workspace::News);
+        assert_eq!(app.asset, btc);
+
+        // Test remove with 'x'
+        app.workspace = Workspace::Market;
+        app.market_mode = MarketMode::Worksheet;
+        app.cursor = 0;
+        let cmd_x = app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(cmd_x, Some("W DEL AAPL".into()));
+
+        // Test remove with Delete key
+        let cmd_del = app.key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(cmd_del, Some("W DEL AAPL".into()));
+
+        // Test cycling market modes with 'm'
+        app.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.market_mode, MarketMode::Overview);
+        app.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.market_mode, MarketMode::Crypto);
+        app.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.market_mode, MarketMode::Wei);
+        app.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(app.market_mode, MarketMode::Worksheet);
     }
 }

@@ -1,0 +1,38 @@
+[package]
+name = "omt-desktop"
+version = "0.1.0"
+edition = "2024"
+default-run = "omt-desktop"
+
+[workspace]
+
+[[bin]]
+name = "omt-desktop"
+path = "src/main.rs"
+
+[lib]
+name = "omt_desktop_lib"
+crate-type = ["lib"]
+path = "src/lib.rs"
+
+[dependencies]
+tauri = { version = "2.2.0", features = ["tray-icon", "custom-protocol"] }
+tauri-plugin-opener = "2.2.0"
+tauri-plugin-window-state = "2.2.0"
+omt-core = { path = "../../../crates/omt-core" }
+omt-data = { path = "../../../crates/omt-data" }
+omt-providers = { path = "../../../crates/omt-providers" }
+omt-storage = { path = "../../../crates/omt-storage" }
+omt-service = { path = "../../../crates/omt-service" }
+tokio = { version = "1.54", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1.43", features = ["serde-with-str"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+directories = "6"
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }

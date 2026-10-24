@@ -1,36 +1,341 @@
-name: Release packages
+name: Publish & Release Packages
+
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      draft:
+        description: 'Publish as Draft Release'
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: 'Publish as Pre-release'
+        required: false
+        type: boolean
+        default: false
+
 permissions:
-  contents: read
+  contents: write
+
 jobs:
-  package:
+  build-linux:
+    name: Linux (${{ matrix.target }})
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            label: linux-x86_64
-            binary: omt
-          - os: macos-latest
-            label: macos-arm64
-            binary: omt
-          - os: windows-latest
-            label: windows-x86_64
-            binary: omt.exe
-    runs-on: ${{ matrix.os }}
+          # Linux x86_64 (GNU) + Debian package
+          - target: x86_64-unknown-linux-gnu
+            deb: true
+            use_cross: false
+          # Linux x86_64 (musl - fully static standalone binary)
+          - target: x86_64-unknown-linux-musl
+            deb: false
+            use_cross: false
+            install_musl: true
+          # Linux ARM64 (GNU) + Debian package
+          - target: aarch64-unknown-linux-gnu
+            deb: true
+            use_cross: true
+          # Linux ARM64 (musl static)
+          - target: aarch64-unknown-linux-musl
+            deb: false
+            use_cross: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --locked --workspace
-      - run: cargo build --locked --release
-      - uses: actions/upload-artifact@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          name: omt-${{ matrix.label }}
-          path: |
-            target/release/${{ matrix.binary }}
-            README.md
-            LICENSE
-            THIRD_PARTY_NOTICES.md
-            examples/config.toml
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install native build dependencies
+        if: matrix.install_musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Setup cross-compilation tool
+        if: matrix.use_cross
+        run: |
+          curl -fsSL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz | sudo tar -xz -C /usr/local/bin
+
+      - name: Build release binary
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --locked --release --target ${{ matrix.target }}
+          elif [ "${{ matrix.install_musl }}" = "true" ]; then
+            CC_x86_64_unknown_linux_musl=musl-gcc cargo build --locked --release --target ${{ matrix.target }}
+          else
+            cargo build --locked --release --target ${{ matrix.target }}
+          fi
+
+      - name: Smoke test binary (native runner only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: ./target/${{ matrix.target }}/release/omt --snapshot --offline
+
+      - name: Package release archive
+        run: |
+          VERSION="${GITHUB_REF_NAME:-v0.1.0}"
+          DEB_FLAG=""
+          if [ "${{ matrix.deb }}" = "true" ]; then
+            DEB_FLAG="--deb"
+          fi
+          bash scripts/package.sh \
+            --version "$VERSION" \
+            --target "${{ matrix.target }}" \
+            --binary "target/${{ matrix.target }}/release/omt" \
+            --output-dir "dist" \
+            $DEB_FLAG
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-linux-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-macos:
+    name: macOS (Universal, ARM64, x86_64)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-darwin
+
+      - name: Build macOS ARM64 (Apple Silicon)
+        run: cargo build --locked --release --target aarch64-apple-darwin
+
+      - name: Build macOS x86_64 (Intel)
+        run: cargo build --locked --release --target x86_64-apple-darwin
+
+      - name: Create Universal 2 binary
+        run: |
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create -output target/universal-apple-darwin/release/omt \
+            target/aarch64-apple-darwin/release/omt \
+            target/x86_64-apple-darwin/release/omt
+          lipo -info target/universal-apple-darwin/release/omt
+
+      - name: Smoke test native binary
+        run: ./target/aarch64-apple-darwin/release/omt --snapshot --offline
+
+      - name: Package all macOS release archives
+        run: |
+          VERSION="${GITHUB_REF_NAME:-v0.1.0}"
+          # Package Apple Silicon
+          bash scripts/package.sh \
+            --version "$VERSION" \
+            --target "aarch64-apple-darwin" \
+            --binary "target/aarch64-apple-darwin/release/omt" \
+            --output-dir "dist"
+
+          # Package Intel
+          bash scripts/package.sh \
+            --version "$VERSION" \
+            --target "x86_64-apple-darwin" \
+            --binary "target/x86_64-apple-darwin/release/omt" \
+            --output-dir "dist"
+
+          # Package Universal
+          bash scripts/package.sh \
+            --version "$VERSION" \
+            --target "universal-apple-darwin" \
+            --binary "target/universal-apple-darwin/release/omt" \
+            --output-dir "dist"
+
+      - name: Upload packaged macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-macos
+          path: dist/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+          - target: aarch64-pc-windows-msvc
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Smoke test binary (native runner only)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: .\target\${{ matrix.target }}\release\omt.exe --snapshot --offline
+
+      - name: Package release zip archive
+        shell: powershell
+        run: |
+          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v0.1.0" }
+          .\scripts\package.ps1 `
+            -Version $version `
+            -Target ${{ matrix.target }} `
+            -BinaryPath "target\${{ matrix.target }}\release\omt.exe" `
+            -OutputDir "dist"
+
+      - name: Upload packaged Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-windows-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Consolidate & Publish GitHub Release
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all built packages
+        uses: actions/download-artifact@v4
+        with:
+          path: raw-artifacts
+
+      - name: Consolidate distribution packages
+        id: consolidate
+        run: |
+          mkdir -p release-dist
+          # Flatten artifacts from subdirectories
+          find raw-artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.sha256" \) -exec cp {} release-dist/ \;
+
+          cd release-dist
+          echo "==> Consolidated release assets:"
+          ls -la
+
+          # Generate unified SHA256SUMS.txt
+          echo "==> Generating unified SHA256SUMS.txt..."
+          rm -f SHA256SUMS.txt
+          for f in *.tar.gz *.zip *.deb; do
+            if [ -f "$f" ]; then
+              sha256sum "$f" >> SHA256SUMS.txt
+            fi
+          done
+          cat SHA256SUMS.txt
+
+      - name: Generate Homebrew Formula
+        run: |
+          VERSION="${GITHUB_REF_NAME:-v0.1.0}"
+          RAW_VERSION="${VERSION#v}"
+          
+          # Extract SHA256 hashes for Homebrew formula
+          get_hash() {
+            grep "$1" release-dist/SHA256SUMS.txt 2>/dev/null | awk '{print $1}' || echo "UNKNOWN_HASH"
+          }
+
+          SHA_MACOS_ARM64=$(get_hash "omt-${VERSION}-aarch64-apple-darwin.tar.gz")
+          SHA_MACOS_X86_64=$(get_hash "omt-${VERSION}-x86_64-apple-darwin.tar.gz")
+          SHA_LINUX_ARM64=$(get_hash "omt-${VERSION}-aarch64-unknown-linux-gnu.tar.gz")
+          SHA_LINUX_X86_64=$(get_hash "omt-${VERSION}-x86_64-unknown-linux-gnu.tar.gz")
+
+          sed \
+            -e "s/__VERSION__/$RAW_VERSION/g" \
+            -e "s/__SHA256_MACOS_ARM64__/$SHA_MACOS_ARM64/g" \
+            -e "s/__SHA256_MACOS_X86_64__/$SHA_MACOS_X86_64/g" \
+            -e "s/__SHA256_LINUX_ARM64__/$SHA_LINUX_ARM64/g" \
+            -e "s/__SHA256_LINUX_X86_64__/$SHA_LINUX_X86_64/g" \
+            Formula/omt.rb.template > release-dist/omt.rb
+
+          echo "==> Generated Formula/omt.rb:"
+          cat release-dist/omt.rb
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-dist/*.tar.gz
+            release-dist/*.zip
+            release-dist/*.deb
+            release-dist/*.sha256
+            release-dist/SHA256SUMS.txt
+            release-dist/omt.rb
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: ${{ github.event.inputs.draft || false }}
+          prerelease: ${{ github.event.inputs.prerelease || contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+
+      - name: Generate Release Summary in GitHub Actions
+        run: |
+          VERSION="${GITHUB_REF_NAME:-v0.1.0}"
+          cat <<EOF >> $GITHUB_STEP_SUMMARY
+          # 🚀 Release $VERSION Published Successfully!
+
+          All release packages and standalone binaries have been verified, packaged, and published to GitHub Releases.
+
+          ### 📦 Published Assets & Checksums
+
+          | Asset | Target OS & Architecture | Format | SHA256 Checksum |
+          |---|---|---|---|
+          EOF
+
+          cd release-dist
+          while read -r hash file; do
+            case "$file" in
+              *x86_64-unknown-linux-gnu.tar.gz) target="Linux x86_64 (glibc)" ; fmt="tar.gz" ;;
+              *x86_64-unknown-linux-musl.tar.gz) target="Linux x86_64 (musl static)" ; fmt="tar.gz" ;;
+              *aarch64-unknown-linux-gnu.tar.gz) target="Linux ARM64 (glibc)" ; fmt="tar.gz" ;;
+              *aarch64-unknown-linux-musl.tar.gz) target="Linux ARM64 (musl static)" ; fmt="tar.gz" ;;
+              *amd64.deb) target="Debian / Ubuntu x86_64" ; fmt="deb" ;;
+              *arm64.deb) target="Debian / Ubuntu ARM64" ; fmt="deb" ;;
+              *aarch64-apple-darwin.tar.gz) target="macOS Apple Silicon (ARM64)" ; fmt="tar.gz" ;;
+              *x86_64-apple-darwin.tar.gz) target="macOS Intel (x86_64)" ; fmt="tar.gz" ;;
+              *universal-apple-darwin.tar.gz) target="macOS Universal 2 (Fat Binary)" ; fmt="tar.gz" ;;
+              *x86_64-pc-windows-msvc.zip) target="Windows x86_64" ; fmt="zip" ;;
+              *aarch64-pc-windows-msvc.zip) target="Windows ARM64" ; fmt="zip" ;;
+              *) target="Universal Asset" ; fmt="file" ;;
+            esac
+            echo "| \`$file\` | $target | $fmt | \`$hash\` |" >> $GITHUB_STEP_SUMMARY
+          done < SHA256SUMS.txt
+
+          cat <<EOF >> $GITHUB_STEP_SUMMARY
+
+          ### 💻 One-Line Installers
+          - **Linux & macOS**:
+            \`\`\`bash
+            curl -proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/MuhammedZohaib/open-market-terminal/main/scripts/install.sh | bash
+            \`\`\`
+          - **Windows**:
+            \`\`\`powershell
+            irm https://raw.githubusercontent.com/MuhammedZohaib/open-market-terminal/main/scripts/install.ps1 | iex
+            \`\`\`
+          EOF

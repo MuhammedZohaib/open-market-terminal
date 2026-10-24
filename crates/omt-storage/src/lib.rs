@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use omt_core::{
-    AssetId, Company,
+    AssetId, Company, Worksheet, WorksheetColumn,
     portfolio::{Transaction, positions},
 };
 use rusqlite::{Connection, params};
@@ -27,8 +27,72 @@ impl Store {
         if version > 1 {
             bail!("Database was created by a newer OMT; refusing to modify it");
         }
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; BEGIN; CREATE TABLE IF NOT EXISTS watchlists(name TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS watch_items(list TEXT NOT NULL REFERENCES watchlists(name),asset TEXT NOT NULL REFERENCES assets(id),PRIMARY KEY(list,asset)); CREATE TABLE IF NOT EXISTS transactions(id TEXT PRIMARY KEY,account TEXT NOT NULL,asset TEXT NOT NULL,at TEXT NOT NULL,json TEXT NOT NULL); CREATE INDEX IF NOT EXISTS transaction_time ON transactions(account,at); CREATE TABLE IF NOT EXISTS cache(kind TEXT NOT NULL,key TEXT NOT NULL,at TEXT NOT NULL,json TEXT NOT NULL,PRIMARY KEY(kind,key)); CREATE INDEX IF NOT EXISTS cache_expiry ON cache(at); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); PRAGMA user_version=1; COMMIT;")?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; BEGIN; CREATE TABLE IF NOT EXISTS watchlists(name TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS watch_items(list TEXT NOT NULL REFERENCES watchlists(name),asset TEXT NOT NULL REFERENCES assets(id),PRIMARY KEY(list,asset)); CREATE TABLE IF NOT EXISTS worksheets(name TEXT PRIMARY KEY,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS transactions(id TEXT PRIMARY KEY,account TEXT NOT NULL,asset TEXT NOT NULL,at TEXT NOT NULL,json TEXT NOT NULL); CREATE INDEX IF NOT EXISTS transaction_time ON transactions(account,at); CREATE TABLE IF NOT EXISTS cache(kind TEXT NOT NULL,key TEXT NOT NULL,at TEXT NOT NULL,json TEXT NOT NULL,PRIMARY KEY(kind,key)); CREATE INDEX IF NOT EXISTS cache_expiry ON cache(at); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); PRAGMA user_version=1; COMMIT;")?;
         Ok(Self { db })
+    }
+    pub fn save_worksheet(&self, ws: &Worksheet) -> Result<()> {
+        let json = serde_json::to_string(ws)?;
+        self.db.execute(
+            "INSERT INTO worksheets (name, json) VALUES (?1, ?2) ON CONFLICT(name) DO UPDATE SET json = ?2",
+            params![ws.name, json],
+        )?;
+        self.ensure_watchlist(&ws.name)?;
+        for asset in &ws.symbols {
+            self.watch(&ws.name, asset, true)?;
+        }
+        Ok(())
+    }
+    pub fn load_worksheet(&self, name: &str) -> Result<Option<Worksheet>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT json FROM worksheets WHERE name = ?1")?;
+        let mut rows = stmt.query([name])?;
+        if let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            let ws: Worksheet = serde_json::from_str(&json)?;
+            return Ok(Some(ws));
+        }
+        // Fallback: migrate from legacy watchlists if exists
+        let legacy_items = self.watchlist(name)?;
+        if !legacy_items.is_empty() || self.watchlists()?.iter().any(|w| w == name) {
+            let ws = Worksheet {
+                name: name.to_string(),
+                columns: WorksheetColumn::default_columns(),
+                symbols: legacy_items,
+            };
+            let _ = self.save_worksheet(&ws);
+            return Ok(Some(ws));
+        }
+        Ok(None)
+    }
+    pub fn list_worksheets(&self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        let mut stmt = self
+            .db
+            .prepare("SELECT name FROM worksheets ORDER BY name")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for name in rows {
+            names.push(name?);
+        }
+        for legacy in self.watchlists()? {
+            if !names.contains(&legacy) {
+                names.push(legacy);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+    pub fn delete_worksheet(&self, name: &str) -> Result<bool> {
+        let count = self
+            .db
+            .execute("DELETE FROM worksheets WHERE name = ?1", [name])?;
+        let _ = self
+            .db
+            .execute("DELETE FROM watch_items WHERE list = ?1", [name]);
+        let _ = self
+            .db
+            .execute("DELETE FROM watchlists WHERE name = ?1", [name]);
+        Ok(count > 0)
     }
     pub fn ensure_watchlist(&self, name: &str) -> Result<()> {
         self.db
@@ -252,5 +316,43 @@ mod tests {
         );
         s.db.execute("UPDATE cache SET json='invalid'", []).unwrap();
         assert!(s.get::<Vec<i32>>("bars", "x").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_worksheet_persistence() {
+        let s = Store::memory().unwrap();
+        let btc: AssetId = "BTCUSDT".parse().unwrap();
+        let eth: AssetId = "ETHUSDT".parse().unwrap();
+
+        let mut ws = Worksheet::new("CRYPTO");
+        ws.columns = vec![
+            WorksheetColumn::Symbol,
+            WorksheetColumn::Last,
+            WorksheetColumn::ChangePct,
+            WorksheetColumn::Volume,
+        ];
+        ws.add(btc.clone());
+        ws.add(eth.clone());
+
+        s.save_worksheet(&ws).unwrap();
+
+        let loaded = s.load_worksheet("CRYPTO").unwrap().unwrap();
+        assert_eq!(loaded.name, "CRYPTO");
+        assert_eq!(loaded.symbols.len(), 2);
+        assert_eq!(loaded.symbols[0], btc);
+        assert_eq!(loaded.symbols[1], eth);
+        assert_eq!(loaded.columns.len(), 4);
+
+        let list = s.list_worksheets().unwrap();
+        assert!(list.contains(&"CRYPTO".to_string()));
+
+        // Also verifies backwards-compatible watchlist sync
+        let legacy_items = s.watchlist("CRYPTO").unwrap();
+        assert_eq!(legacy_items.len(), 2);
+
+        // Delete worksheet
+        assert!(s.delete_worksheet("CRYPTO").unwrap());
+        assert!(s.load_worksheet("CRYPTO").unwrap().is_none());
+        assert!(!s.delete_worksheet("CRYPTO").unwrap()); // already deleted
     }
 }

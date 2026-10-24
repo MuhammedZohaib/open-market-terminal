@@ -1,5 +1,7 @@
 use crate::{AssetId, Timeframe};
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Workspace {
     Market,
     Chart,
@@ -9,9 +11,10 @@ pub enum Workspace {
     Port,
     Econ,
     Impact,
+    Des,
 }
 impl Workspace {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Market,
         Self::Chart,
         Self::Fin,
@@ -20,6 +23,7 @@ impl Workspace {
         Self::Port,
         Self::Econ,
         Self::Impact,
+        Self::Des,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -31,6 +35,7 @@ impl Workspace {
             Self::Port => "PORT",
             Self::Econ => "ECON",
             Self::Impact => "IMPACT",
+            Self::Des => "DES",
         }
     }
     pub fn mnemonic(self) -> &'static str {
@@ -43,14 +48,28 @@ impl Workspace {
             Self::Port => "PRTU",
             Self::Econ => "ECST",
             Self::Impact => "EVT",
+            Self::Des => "DES",
         }
     }
 }
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorksheetAction {
+    Open(Option<String>),
+    Create(String),
+    Delete(String),
+    Add(AssetId),
+    Remove(AssetId),
+    Columns(Vec<crate::WorksheetColumn>),
+    List,
+    Reset,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Open(Workspace, Option<AssetId>, Option<Timeframe>),
     Watch(bool, AssetId),
     Watchlist(String),
+    Worksheet(WorksheetAction),
     Help,
     Settings,
     Raw(Vec<String>),
@@ -58,6 +77,13 @@ pub enum Command {
 pub const COMMANDS: &[&str] = &[
     "ALERT",
     "ALERT LIST",
+    "ALERT ADD",
+    "ALERT REMOVE",
+    "LINK",
+    "LINK A",
+    "LINK B",
+    "LINK NONE",
+    "STUDY",
     "ALERT ADD",
     "ALERT REMOVE",
     "STUDY",
@@ -109,6 +135,15 @@ pub const COMMANDS: &[&str] = &[
     "WATCH ADD",
     "WATCH REMOVE",
     "WATCHLIST",
+    "W",
+    "W CREATE",
+    "W ADD",
+    "W DEL",
+    "W DROP",
+    "W COL",
+    "W LIST",
+    "W RESET",
+    "WORKSHEET",
     "BUY",
     "ACCOUNT",
     "PRESET",
@@ -153,6 +188,8 @@ fn parse_workspace(token: &str) -> Option<(Workspace, Option<Timeframe>)> {
         "SCAN" | "SRCH" => Some((Workspace::Scan, None)),
         "PORT" | "PRTU" => Some((Workspace::Port, None)),
         "ECON" | "ECST" | "ECO" => Some((Workspace::Econ, None)),
+        "IMPACT" | "EVT" => Some((Workspace::Impact, None)),
+        "DES" => Some((Workspace::Des, None)),
         _ => None,
     }
 }
@@ -211,6 +248,8 @@ pub fn parse(text: &str) -> Result<Command, String> {
                 | "LAYOUT"
                 | "PRESET"
                 | "WATCH"
+                | "W"
+                | "WORKSHEET"
                 | "BUY"
                 | "SELL"
                 | "INDEX"
@@ -308,6 +347,85 @@ pub fn parse(text: &str) -> Result<Command, String> {
             }
         }
     }
+    if head == "W" || head == "WORKSHEET" {
+        if parts.len() == 1 {
+            return Ok(Command::Worksheet(WorksheetAction::Open(None)));
+        }
+        let sub = parts[1].to_ascii_uppercase();
+        match sub.as_str() {
+            "LIST" => return Ok(Command::Worksheet(WorksheetAction::List)),
+            "RESET" => return Ok(Command::Worksheet(WorksheetAction::Reset)),
+            "CREATE" => {
+                if parts.len() < 3 {
+                    return Err("Usage: W CREATE <NAME>".into());
+                }
+                return Ok(Command::Worksheet(WorksheetAction::Create(
+                    parts[2].to_string(),
+                )));
+            }
+            "DEL" | "REMOVE" => {
+                if parts.len() < 3 {
+                    return Err("Usage: W DEL <SYMBOL>".into());
+                }
+                return Ok(Command::Worksheet(WorksheetAction::Remove(
+                    parts[2].parse()?,
+                )));
+            }
+            "DROP" | "DELETE" => {
+                if parts.len() < 3 {
+                    return Err("Usage: W DROP <NAME>".into());
+                }
+                return Ok(Command::Worksheet(WorksheetAction::Delete(
+                    parts[2].to_string(),
+                )));
+            }
+            "ADD" => {
+                if parts.len() < 3 {
+                    return Err("Usage: W ADD <SYMBOL>".into());
+                }
+                return Ok(Command::Worksheet(WorksheetAction::Add(parts[2].parse()?)));
+            }
+            "COL" | "COLS" | "COLUMN" | "COLUMNS" => {
+                if parts.len() < 3 {
+                    return Err("Usage: W COL <COL1> <COL2> ...".into());
+                }
+                let mut cols = Vec::new();
+                for col_str in &parts[2..] {
+                    if let Some(c) = crate::WorksheetColumn::parse_column(col_str)
+                        && !cols.contains(&c)
+                    {
+                        cols.push(c);
+                    }
+                }
+                if cols.is_empty() {
+                    return Err(
+                        "Invalid columns. Available: SYM, LAST, CHG%, CHG, VOL, TURNOVER, BID, ASK, SPREAD, PE, MCAP, NEWS"
+                            .into(),
+                    );
+                }
+                return Ok(Command::Worksheet(WorksheetAction::Columns(cols)));
+            }
+            _ => {
+                return Ok(Command::Worksheet(WorksheetAction::Open(Some(
+                    parts[1].to_string(),
+                ))));
+            }
+        }
+    }
+    if parts.len() >= 2
+        && parts[1].eq_ignore_ascii_case("W")
+        && let Ok(asset) = parts[0].parse::<AssetId>()
+    {
+        if parts.len() == 2 {
+            return Ok(Command::Open(Workspace::Market, Some(asset), None));
+        }
+        let action = parts[2].to_ascii_uppercase();
+        match action.as_str() {
+            "ADD" => return Ok(Command::Worksheet(WorksheetAction::Add(asset))),
+            "DEL" | "REMOVE" => return Ok(Command::Worksheet(WorksheetAction::Remove(asset))),
+            _ => {}
+        }
+    }
     if let Some((w, default_tf)) = parse_workspace(&head) {
         if parts.len() > 3 {
             return Err("Use WORKSPACE [SYMBOL] [TIMEFRAME]".into());
@@ -315,16 +433,6 @@ pub fn parse(text: &str) -> Result<Command, String> {
         let asset = parts.get(1).map(|s| s.parse()).transpose()?;
         let tf = parts.get(2).map(|s| s.parse()).transpose()?.or(default_tf);
         return Ok(Command::Open(w, asset, tf));
-    }
-    if head == "DES" {
-        if parts.len() > 2 {
-            return Err("Use DES [SYMBOL]".into());
-        }
-        let mut raw = vec!["DES".to_string()];
-        if let Some(s) = parts.get(1) {
-            raw.push(s.to_string());
-        }
-        return Ok(Command::Raw(raw));
     }
     if matches!(head.as_str(), "YCRV" | "GC") && parts.len() == 1 {
         return Ok(Command::Raw(vec!["TREASURY".into()]));
@@ -341,9 +449,10 @@ pub fn parse(text: &str) -> Result<Command, String> {
             Ok(Command::Watch(add, parts[2].parse()?))
         }
         "WATCHLIST" if parts.len() == 2 => Ok(Command::Watchlist(parts[1].into())),
+        "WATCHLIST" if parts.len() == 1 => Ok(Command::Worksheet(WorksheetAction::List)),
         "BUY" | "SELL" | "DELTX" | "IMPORT" | "EXPORT" | "WB" | "FRED" | "TREASURY" | "FILTER"
         | "SORT" | "INDEX" | "ACCOUNT" | "PRESET" | "IND" | "QUOTE" | "MINVOL" | "STATUS"
-        | "OPEN" | "READ" | "REFRESH" | "LAYOUT" | "BACK" | "PLOT" => {
+        | "OPEN" | "READ" | "REFRESH" | "LAYOUT" | "BACK" | "PLOT" | "LINK" => {
             Ok(Command::Raw(parts.iter().map(|s| s.to_string()).collect()))
         }
         _ if parts.len() >= 2 => {
@@ -361,12 +470,6 @@ pub fn parse(text: &str) -> Result<Command, String> {
                 let asset: AssetId = parts[0].parse()?;
                 let tf = parts.get(2).map(|s| s.parse()).transpose()?.or(default_tf);
                 return Ok(Command::Open(w, Some(asset), tf));
-            }
-            if second == "DES" && parts.len() == 2 {
-                return Ok(Command::Raw(vec![
-                    "DES".into(),
-                    parts[0].to_ascii_uppercase(),
-                ]));
             }
             Err("Unknown command. Press ? for help.".into())
         }
@@ -407,7 +510,19 @@ mod tests {
         ));
         assert!(matches!(
             parse("AAPL DES"),
-            Ok(Command::Raw(v)) if v == vec!["DES", "AAPL"]
+            Ok(Command::Open(Workspace::Des, Some(a), None)) if a.symbol == "AAPL"
+        ));
+        assert!(matches!(
+            parse("DES AAPL"),
+            Ok(Command::Open(Workspace::Des, Some(a), None)) if a.symbol == "AAPL"
+        ));
+        assert!(matches!(
+            parse("DES"),
+            Ok(Command::Open(Workspace::Des, None, None))
+        ));
+        assert!(matches!(
+            parse("BTCUSDT DES"),
+            Ok(Command::Open(Workspace::Des, Some(a), None)) if a.symbol == "BTCUSDT"
         ));
         assert!(matches!(
             parse("YCRV <GO>"),
@@ -448,5 +563,76 @@ mod tests {
         assert_eq!(Workspace::Market.mnemonic(), "MKT");
         assert!(parse("WATCH DELETE BTCUSDT").is_err());
         assert!(parse(" ").is_err());
+
+        // Test Worksheet commands
+        assert_eq!(
+            parse("W"),
+            Ok(Command::Worksheet(WorksheetAction::Open(None)))
+        );
+        assert_eq!(
+            parse("WORKSHEET <GO>"),
+            Ok(Command::Worksheet(WorksheetAction::Open(None)))
+        );
+        assert_eq!(
+            parse("W TECH"),
+            Ok(Command::Worksheet(WorksheetAction::Open(Some(
+                "TECH".into()
+            ))))
+        );
+        assert_eq!(
+            parse("W CREATE ENERGY"),
+            Ok(Command::Worksheet(WorksheetAction::Create("ENERGY".into())))
+        );
+        assert_eq!(
+            parse("W DROP ENERGY"),
+            Ok(Command::Worksheet(WorksheetAction::Delete("ENERGY".into())))
+        );
+        assert_eq!(
+            parse("W DELETE ENERGY"),
+            Ok(Command::Worksheet(WorksheetAction::Delete("ENERGY".into())))
+        );
+        assert_eq!(
+            parse("W LIST"),
+            Ok(Command::Worksheet(WorksheetAction::List))
+        );
+        assert_eq!(
+            parse("W RESET"),
+            Ok(Command::Worksheet(WorksheetAction::Reset))
+        );
+        assert_eq!(
+            parse("W ADD AAPL"),
+            Ok(Command::Worksheet(WorksheetAction::Add(
+                "AAPL".parse().unwrap()
+            )))
+        );
+        assert_eq!(
+            parse("W DEL AAPL"),
+            Ok(Command::Worksheet(WorksheetAction::Remove(
+                "AAPL".parse().unwrap()
+            )))
+        );
+        assert_eq!(
+            parse("AAPL W ADD"),
+            Ok(Command::Worksheet(WorksheetAction::Add(
+                "AAPL".parse().unwrap()
+            )))
+        );
+        assert_eq!(
+            parse("BTCUSDT W DEL"),
+            Ok(Command::Worksheet(WorksheetAction::Remove(
+                "BTCUSDT".parse().unwrap()
+            )))
+        );
+        assert_eq!(
+            parse("W COL SYM LAST CHG% VOL"),
+            Ok(Command::Worksheet(WorksheetAction::Columns(vec![
+                crate::WorksheetColumn::Symbol,
+                crate::WorksheetColumn::Last,
+                crate::WorksheetColumn::ChangePct,
+                crate::WorksheetColumn::Volume,
+            ])))
+        );
+        assert!(parse("W COL").is_err());
+        assert!(parse("W COL INVALID_XYZ").is_err());
     }
 }

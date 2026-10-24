@@ -1,5 +1,16 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "crates/omt-core",
+    "crates/omt-data",
+    "crates/omt-providers",
+    "crates/omt-storage",
+    "crates/omt-tui",
+    "crates/omt-app",
+    "crates/omt-service",
+]
+exclude = [
+    "apps/desktop/src-tauri",
+]
 default-members = ["crates/omt-app"]
 resolver = "2"
 
@@ -8,6 +19,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
+authors = ["Open Market Terminal Contributors"]
+repository = "https://github.com/MuhammedZohaib/open-market-terminal"
+homepage = "https://github.com/MuhammedZohaib/open-market-terminal"
+readme = "README.md"
+keywords = ["terminal", "financial", "bloomberg", "tui", "crypto"]
+categories = ["command-line-utilities"]
 
 [workspace.dependencies]
 omt-core = { path = "crates/omt-core" }
@@ -15,6 +32,7 @@ omt-data = { path = "crates/omt-data" }
 omt-providers = { path = "crates/omt-providers" }
 omt-storage = { path = "crates/omt-storage" }
 omt-tui = { path = "crates/omt-tui" }
+omt-service = { path = "crates/omt-service" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
