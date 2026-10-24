@@ -129,5 +129,5 @@ echo "Successfully packaged $TAR_NAME (SHA256: $HASH)"
 
 # Build Debian package if requested
 if [ "$BUILD_DEB" = true ] && [[ "$TARGET" =~ linux ]]; then
-  "$SCRIPT_DIR/build-deb.sh" "$BINARY_PATH" "$VERSION" "$TARGET" "$OUTPUT_DIR"
+  bash "$SCRIPT_DIR/build-deb.sh" "$BINARY_PATH" "$VERSION" "$TARGET" "$OUTPUT_DIR"
 fi
